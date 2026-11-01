@@ -22,5 +22,4 @@ perf.data
 /docs/route_run.log
 patches.json
 !launcher/sotc.png
-out/
 sotc.ini

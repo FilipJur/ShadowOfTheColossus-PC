@@ -71,6 +71,18 @@ inline std::atomic<uint64_t> current_program{0}; ///< hash of the dispatch being
 inline std::atomic<uint64_t> readback_ahead{0};   ///< downloads of already submitted work
 inline std::atomic<uint64_t> readback_finish{0};  ///< downloads that flushed the current work
 inline std::atomic<uint64_t> readback_finish_asked{0}; ///< ... for bytes the guest itself asked
+/// ... the ahead path was idle only because sparse binds were pending (data itself submitted)
+inline std::atomic<uint64_t> readback_finish_binds{0};
+/// ... only the widened window of the asked bytes was written by the command buffer being built
+inline std::atomic<uint64_t> readback_finish_window{0};
+/// ... only a hot region brought along was written by the command buffer being built
+inline std::atomic<uint64_t> readback_finish_hot{0};
+/// async readbacks whose window was re-written in flight and re-read synchronously
+inline std::atomic<uint64_t> readback_dirty_retries{0};
+/// stale hot bring-alongs dropped instead of forcing that synchronous re-read (SOTC_RB_PART)
+inline std::atomic<uint64_t> rb_dirty_hot_dropped{0};
+/// Dirtied readback windows re-read asynchronously (another round trip) instead of synchronously.
+inline std::atomic<uint64_t> rb_requeues{0};
 inline std::atomic<uint64_t> heap_guard_builds{0}; ///< readbacks into the BPE heap
 inline std::atomic<uint64_t> heap_guard_stale_hits{0}; ///< writes the previous guard vouched for
 inline std::atomic<uint64_t> upload_deferred{0};        ///< first uploads put off to a later frame
@@ -208,6 +220,8 @@ inline std::atomic<uint64_t> image_query_ns{0}, image_alloc_ns{0}, image_dedicat
 /// Video memory: usage the driver reports (texture cache GC), budget the GC works with, and the
 /// sparse buffer arena memory (never released) as allocations and bytes.
 inline std::atomic<uint64_t> vram_used{0}, vram_budget{0}, arena_allocs{0}, arena_bytes{0};
+/// sotc: host (not device-local) heaps: usage reported by the driver, and VMA's blocks in them.
+inline std::atomic<uint64_t> host_heap_usage{0}, host_vma_block_bytes{0};
 /// Texture cache collector: ticks (one per submit with a frame's work), images freed and those
 /// written back to memory first, and the images in the cache with their (guest) size.
 inline std::atomic<uint64_t> gc_ticks{0}, gc_freed{0}, gc_downloads{0};
@@ -399,6 +413,29 @@ struct FrameTimer {
         }
     }
 };
+
+/// sotc: SOTC_TICKWATCH=1 -- a watcher thread on the draw scheduler samples its timeline
+/// semaphore (vk_scheduler.cpp StartTickWatch); submits and GPU progress land in this ring and
+/// the FLIPGAP detector (videoout/driver.cpp) prints what the timeline did during a gap.
+/// Diagnostic: off by default, never on in benchmarks.
+inline const bool kTickWatch = [] {
+    const char* v = std::getenv("SOTC_TICKWATCH");
+    return v && v[0] == '1';
+}();
+struct TickEvent {
+    int64_t t_ns;  ///< steady_clock time_since_epoch (NowNs)
+    uint64_t gpu;  ///< kind 0: known GPU tick; kind 1/2: the tick submitted
+    uint64_t sub;  ///< kind 0: newest submitted tick; kind 1: (wait semas << 8) | cmd buffers;
+                   ///< kind 2: (submit_mutex wait us << 32) | vkQueueSubmit us
+    uint32_t kind; ///< 0 progress sample, 1 SubmitExecution, 2 put on the Vulkan queue
+};
+inline constexpr size_t kTickRing = 8192;
+inline TickEvent tick_ring[kTickRing];
+inline std::atomic<uint64_t> tick_ring_head{0};
+inline void PushTick(uint32_t kind, uint64_t gpu, uint64_t sub) {
+    const uint64_t i = tick_ring_head.fetch_add(1, std::memory_order_relaxed);
+    tick_ring[i % kTickRing] = {static_cast<int64_t>(NowNs()), gpu, sub, kind};
+}
 
 /// SOTC_DROP_TRACE=1: logs the first 80 draws/dispatches of each kind that are dropped.
 inline void Drop(int kind, unsigned long long a, unsigned long long b) {

@@ -18,6 +18,13 @@ add_compile_options(-fno-omit-frame-pointer)
 option(BB_LTO "Link-time optimization of bbgpu" ON)
 set(BB_PGO "off" CACHE STRING "Profile-guided optimization: off, generate, use")
 set(BB_PGO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../pgo" CACHE PATH "Profile directory")
+# sotc: optional -march for local benchmark builds (BB_MARCH=x86-64-v3, native, znver3...). Empty
+# keeps the portable build that runs on the Steam Deck; the default is unchanged.
+set(BB_MARCH "" CACHE STRING "Extra -march for bbgpu (empty keeps the portable build)")
+if (BB_MARCH)
+    add_compile_options(-march=${BB_MARCH})
+    message(STATUS "bbgpu: -march=${BB_MARCH}")
+endif()
 if (BB_LTO)
     include(CheckIPOSupported)
     check_ipo_supported(RESULT bb_ipo_ok OUTPUT bb_ipo_error)
@@ -63,14 +70,36 @@ if (NOT magic_enum_FOUND)
     target_include_directories(magic_enum INTERFACE third_party/magic_enum/include
                                                     third_party/magic_enum/include/magic_enum)
 endif()
-find_package(tsl-robin-map REQUIRED)
+include(FetchContent)
+# bbport: tsl-robin-map, VulkanMemoryAllocator and Zydis are system packages on some hosts and
+# missing on others (MSYS2, most Linux distributions): the pinned upstream releases are fetched
+# when the system has no package for them.
+find_package(tsl-robin-map QUIET)
+if (NOT TARGET tsl::robin_map)
+    # robin-map still asks for CMake 3.3; allow it under CMake 4 like the miniz block below.
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+    FetchContent_Declare(robin-map
+        GIT_REPOSITORY https://github.com/Tessil/robin-map
+        GIT_TAG v1.3.0
+        GIT_SHALLOW TRUE)
+    FetchContent_MakeAvailable(robin-map)
+    unset(CMAKE_POLICY_VERSION_MINIMUM)
+endif()
 find_package(VulkanMemoryAllocator CONFIG QUIET)
-if (NOT VulkanMemoryAllocator_FOUND)
+if (NOT TARGET GPUOpen::VulkanMemoryAllocator)
     # MSYS2 ships the header (include/vma/vk_mem_alloc.h) without a CMake package.
-    find_path(VMA_INCLUDE_DIR vk_mem_alloc.h PATH_SUFFIXES vma REQUIRED)
-    add_library(VulkanMemoryAllocator INTERFACE)
-    add_library(GPUOpen::VulkanMemoryAllocator ALIAS VulkanMemoryAllocator)
-    target_include_directories(VulkanMemoryAllocator INTERFACE ${VMA_INCLUDE_DIR})
+    find_path(VMA_INCLUDE_DIR vk_mem_alloc.h PATH_SUFFIXES vma)
+    if (VMA_INCLUDE_DIR)
+        add_library(VulkanMemoryAllocator INTERFACE)
+        add_library(GPUOpen::VulkanMemoryAllocator ALIAS VulkanMemoryAllocator)
+        target_include_directories(VulkanMemoryAllocator INTERFACE ${VMA_INCLUDE_DIR})
+    else()
+        FetchContent_Declare(VulkanMemoryAllocator
+            GIT_REPOSITORY https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator
+            GIT_TAG v3.1.0
+            GIT_SHALLOW TRUE)
+        FetchContent_MakeAvailable(VulkanMemoryAllocator)
+    endif()
 endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(XXHASH REQUIRED IMPORTED_TARGET libxxhash)
@@ -89,7 +118,28 @@ if (NOT miniz_FOUND)
     unset(CMAKE_POLICY_VERSION_MINIMUM)
     add_library(miniz::miniz ALIAS miniz)
 endif()
-find_package(Zydis REQUIRED)
+find_package(Zydis QUIET)
+if (NOT TARGET Zydis::Zydis)
+    # Zydis 5.0 changed its API: the 4.1.1 release is pinned. It needs the matching Zycore.
+    set(ZYDIS_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+    set(ZYDIS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(zycore
+        GIT_REPOSITORY https://github.com/zyantific/zycore-c
+        GIT_TAG v1.5.2
+        GIT_SHALLOW TRUE)
+    FetchContent_MakeAvailable(zycore)
+    if (NOT DEFINED ZYAN_ZYCORE_PATH)
+        set(ZYAN_ZYCORE_PATH ${zycore_SOURCE_DIR} CACHE PATH "Zycore sources used by Zydis")
+    endif()
+    FetchContent_Declare(zydis
+        GIT_REPOSITORY https://github.com/zyantific/zydis
+        GIT_TAG v4.1.1
+        GIT_SHALLOW TRUE)
+    FetchContent_MakeAvailable(zydis)
+    if (NOT TARGET Zydis::Zydis)
+        add_library(Zydis::Zydis ALIAS Zydis)
+    endif()
+endif()
 find_program(GLSLANG_COMPILER NAMES glslang glslangValidator REQUIRED)
 
 set(SIRIT_USE_SYSTEM_SPIRV_HEADERS OFF CACHE BOOL "" FORCE)
@@ -267,12 +317,12 @@ if (NOT WIN32)
 endif()
 target_link_libraries(bbgpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
     tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::FFMPEG miniz::miniz Zydis::Zydis sirit)
+target_include_directories(bbgpu PRIVATE third_party/xbyak)
 if (WIN32)
     # Guest code is entered with the System V ABI; NOMINMAX/WIN32_LEAN_AND_MEAN keep
     # <windows.h> out of the way of std::min/max and the Vulkan/SDL headers.
     target_compile_definitions(bbgpu PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
     target_compile_options(bbgpu PRIVATE -include ${CMAKE_CURRENT_SOURCE_DIR}/shim/bb_win_compat.h)
-    target_include_directories(bbgpu PRIVATE third_party/xbyak)
     target_link_libraries(bbgpu PUBLIC Vulkan::Vulkan ws2_32 bcrypt ntdll synchronization winmm)
 else()
     target_link_libraries(bbgpu PUBLIC PkgConfig::X11)
@@ -296,6 +346,14 @@ if (WIN32)
     # The PS4 range (64 GiB - 1 TiB) must stay free: no high-entropy ASLR for heaps and stacks.
     # The guest main thread runs on the process stack: 16 MiB, committed (no stack probes).
     target_link_options(bb-probe PRIVATE -Wl,--disable-high-entropy-va "SHELL:-Xlinker --stack -Xlinker 16777216,16777216")
+    # sotc: leak hunting build (SOTC_HEAP_TRACK=<file>, see shim/bbport_heap_track.cpp).
+    option(BB_HEAP_TRACK "Wrap malloc/new and record live allocations by call stack" OFF)
+    if (BB_HEAP_TRACK)
+        target_sources(bb-probe PRIVATE shim/bbport_heap_track.cpp)
+        target_compile_definitions(bb-probe PRIVATE BB_HEAP_TRACK)
+        target_link_options(bb-probe PRIVATE
+            -Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc,--wrap=free)
+    endif()
     add_executable(bb-gpu-capabilities ../tools/gpu_capabilities.c ../packaging/windows/bb-gpu-capabilities.rc)
     target_link_libraries(bb-gpu-capabilities PRIVATE Vulkan::Vulkan)
 endif()
