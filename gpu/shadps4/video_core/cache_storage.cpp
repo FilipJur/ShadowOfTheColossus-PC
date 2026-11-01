@@ -156,7 +156,7 @@ static constexpr char PackMagic[8] = {'S', 'O', 'T', 'C', 'P', 'K', '1', '\0'};
 
 static void ReadCachePack(const std::filesystem::path& path,
                           std::map<std::string, std::vector<u8>>& out) {
-    std::FILE* f = _wfopen(path.c_str(), L"rb");
+    std::FILE* f = Common::FS::OpenCFile(path, Common::FS::FileAccessMode::Read);
     if (!f) {
         return;
     }
@@ -207,7 +207,7 @@ static void WriteCachePack(std::filesystem::path path,
                            std::vector<std::pair<std::string, std::vector<u8>>> files) {
     auto tmp = path;
     tmp += L".tmp";
-    std::FILE* f = _wfopen(tmp.c_str(), L"wb");
+    std::FILE* f = Common::FS::OpenCFile(tmp, Common::FS::FileAccessMode::Create);
     if (!f) {
         return;
     }
@@ -244,14 +244,31 @@ void DataBase::Prefetch() {
     }
     std::vector<std::filesystem::path> files;
     std::error_code ec;
-    size_t in_pack = 0, on_disk = 0;
+    size_t in_pack = 0, on_disk = 0, newer = 0;
+    // sotc: a loose file written after the pack (a shader translated again in a later session,
+    // e.g. after a ShaderBinaryVersion change) holds the current data: it wins over the pack's
+    // copy, and the pack is rewritten with it below. Taking the pack's copy left those entries
+    // stale for good: the same shaders were translated again in every session (fix by
+    // HiddenUserHere, upstream PR #339).
+    std::error_code time_ec;
+    const auto pack_time = std::filesystem::last_write_time(pack_path, time_ec);
+    const bool have_pack_time = !time_ec && !packed.empty();
     for (const auto& entry : std::filesystem::directory_iterator{cache_path, ec}) {
         const auto ext = entry.path().extension();
         if (!entry.is_regular_file(ec) || ext == ".tmp" || ext == ".sotcpack") {
             continue;
         }
         ++on_disk;
-        const auto it = packed.find(entry.path().filename().string());
+        auto it = packed.find(entry.path().filename().string());
+        if (it != packed.end() && have_pack_time) {
+            std::error_code entry_ec;
+            const auto entry_time = entry.last_write_time(entry_ec);
+            if (!entry_ec && entry_time > pack_time) {
+                packed.erase(it);
+                it = packed.end();
+                ++newer;
+            }
+        }
         if (it != packed.end()) {
             ++in_pack;
             prefetched.emplace(it->first, std::move(it->second));
@@ -312,8 +329,10 @@ void DataBase::Prefetch() {
         }
         std::thread{WriteCachePack, pack_path, std::move(copy)}.detach();
     }
-    std::fprintf(stderr, "SOTC shader cache: %zu files, %zu from the pack, %zu read one by one\n",
-                 on_disk, in_pack, files.size());
+    std::fprintf(stderr,
+                 "SOTC shader cache: %zu files, %zu from the pack, %zu read one by one (%zu newer "
+                 "than the pack)\n",
+                 on_disk, in_pack, files.size(), newer);
     LOG_INFO(Render, "Prefetched {} cache files ({} MiB) in {} ms with {} threads",
              prefetched.size(), bytes >> 20,
              std::chrono::duration_cast<std::chrono::milliseconds>(
