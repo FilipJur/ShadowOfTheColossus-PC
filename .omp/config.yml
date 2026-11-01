@@ -32,8 +32,8 @@ task:
     sonic: "@task"
     reviewer: "@task"
   isolation:
+    enabled: true
     merge: branch
     apply: false
-  softRequestBudget: 600
 display:
   subagentLivePreview: true
