@@ -3,6 +3,7 @@
 #include "bbport_overlay.h"
 #include "bbport_settings.h"
 #include "bbport_copy.h"
+#include "bbport_mem_report.h"
 #ifndef _WIN32
 #include <sys/resource.h>
 #endif
@@ -148,7 +149,15 @@ static void CopySparseSerial(VAddr source, u8* dest, u64 size) {
         // readbacks GPU-written pages are read-protected, and a fault on a copy thread or the
         // recording thread would wait for the command processor, which waits for them.
         const u8* backing = mapped ? runtime_memory_backing_pointer(source) : nullptr;
-        if (backing) std::memcpy(dest, backing, n);
+        if (backing && BbMemReport::WsDiagEnabled()) {
+            const uint64_t before = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count());
+            BbMemReport::WsDiagCopy(backing, reinterpret_cast<const void*>(source), dest, n);
+            std::memcpy(dest, backing, n);
+            BbMemReport::WsDiagCopyDone(before, n);
+        } else if (backing) std::memcpy(dest, backing, n);
         else if (mapped) std::memcpy(dest, reinterpret_cast<const void*>(source), n);
         else std::memset(dest, 0, n);
         source += n; dest += n; size -= n;
@@ -400,6 +409,20 @@ extern "C" void bbgpu_register_guest_stack_end(uintptr_t address, uint64_t size)
 extern "C" int bbgpu_readbacks_mode(void) {
     return static_cast<int>(EmulatorSettings.GetReadbacksMode());
 }
+#ifndef _WIN32
+// sotc (Linux): weak fallbacks for the loader's helper-thread read window (src/probe.c,
+// gabriel/linux-native). The video core's page_manager.cpp defines the real pair strongly
+// (slice 2 owns that file); these stubs only keep the link whole where it does not, and
+// always report "no state" so the loader falls back to its own protection handling.
+__attribute__((weak)) extern "C" int bbgpu_page_read_watched(uintptr_t address) {
+    (void)address;
+    return 0;
+}
+__attribute__((weak)) extern "C" int bbgpu_page_restore(uintptr_t address) {
+    (void)address;
+    return 0;
+}
+#endif
 
 extern "C" int bbgpu_handle_fault(void* ucontext, void* address) {
     return Core::Signals::Instance()->DispatchAccessViolation(ucontext, address) ? 1 : 0;
