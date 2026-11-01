@@ -19,6 +19,7 @@ Writes two files for the loader:
                    +r_motionBlurEnable=0. Modes that are only cvars:
                    af16   16x anisotropic filtering on every texture
                    hdr    the game's HDR rendering (needs the HDR10 output: Windows HDR on)
+The original bytes are checked first: another game version gets neither file's changes.
 """
 import argparse
 import os
