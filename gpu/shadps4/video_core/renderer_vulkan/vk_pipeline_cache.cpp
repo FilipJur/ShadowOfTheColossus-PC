@@ -364,6 +364,10 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     if (amd64_lds) {
         std::fprintf(stderr, "GPU: LDS barriers on for 64-wide AMD (SOTC_AMD64_LDS=0: off)\n");
     }
+    if (instance.IsAmdWave32Forced()) {
+        std::fprintf(stderr, "GPU: AMD wave32 on: shaders lowered for 32 lanes, LDS barriers on "
+                             "(SOTC_AMD_WAVE32)\n");
+    }
     // Wave64 uniform branches on every driver. Tested on a Radeon RX 6650 XT (32-wide path):
     // off, the shadows next to the Wander and Agro on grass get horizontal stripes; on, the
     // image is right and the characters are not black in the shade (save with 5 colossi).
@@ -456,7 +460,11 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     std::vector<u8> driver_cache_data;
     if (DriverCacheEnabled()) {
         const auto path = DriverCachePath();
+#ifdef _WIN32
         if (std::FILE* f = _wfopen(path.c_str(), L"rb")) {
+#else
+        if (std::FILE* f = std::fopen(path.c_str(), "rb")) {
+#endif
             std::fseek(f, 0, SEEK_END);
             const long size = std::ftell(f);
             std::fseek(f, 0, SEEK_SET);
@@ -547,11 +555,14 @@ void PipelineCache::SaveDriverCache() {
         return;
     }
     data.resize(size);
-    // Written next to it and renamed: a crash while writing keeps the old copy.
     const auto path = DriverCachePath();
     auto tmp = path;
     tmp += L".tmp";
+#ifdef _WIN32
     std::FILE* f = _wfopen(tmp.c_str(), L"wb");
+#else
+    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+#endif
     if (!f) {
         return;
     }
@@ -589,6 +600,23 @@ static void LogSyncPipeline(const char* kind, const char* reason,
     std::fprintf(stderr, "SOTC SYNC PIPELINE %s (%s) %.0f ms, shaders %016llx %016llx, at %.1f\n",
                  kind, reason, ms, static_cast<unsigned long long>(hash_a),
                  static_cast<unsigned long long>(hash_b), at);
+}
+
+// sotc: a pipeline built on a pipeline worker that took SOTC_SLOW_BUILD_MS (default 500) or longer
+// is logged: the recorder waits for compute pipelines at their dispatch, so on drivers that compile
+// slowly (Intel Arc users saw 13 s freezes on first visits) these are the freezes.
+void LogSlowBuild(const char* kind, std::chrono::steady_clock::time_point start) {
+    const double ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+            .count();
+    static const double min_ms = [] {
+        const char* v = std::getenv("SOTC_SLOW_BUILD_MS");
+        return v ? std::atof(v) : 500.0;
+    }();
+    static std::atomic<int> logged{0};
+    if (ms >= min_ms && logged.fetch_add(1, std::memory_order_relaxed) < 500) {
+        std::fprintf(stderr, "SOTC SLOW BUILD %s %.0f ms\n", kind, ms);
+    }
 }
 
 bool PipelineCache::AsyncPipelineEligible() const {
@@ -683,6 +711,7 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
         if (job->compute) {
             const auto start = std::chrono::steady_clock::now();
             job->compute->Build();
+            LogSlowBuild("compute", start);
             SotcStats::async_compute_built.fetch_add(1, std::memory_order_relaxed);
             SotcStats::async_compute_build_ns.fetch_add(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -691,10 +720,12 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
                 std::memory_order_relaxed);
             continue;
         }
+        const auto graphics_start = std::chrono::steady_clock::now();
         job->pipeline = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, job->key, *pipeline_cache, job->infos,
             job->runtime_infos, job->fetch_shader ? &*job->fetch_shader : nullptr, job->modules,
             job->sdata, job->preloaded, true);
+        LogSlowBuild("graphics", graphics_start);
         SotcStats::frame_compiles.fetch_add(1, std::memory_order_relaxed);
         std::scoped_lock lock{async_mutex};
         async_done.push_back(std::move(job));
