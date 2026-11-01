@@ -94,7 +94,7 @@ static char update_root[512];
 const char *runtime_file_update_dir(void) { return update_root; }
 const char *runtime_file_user_dir(void) { return user_root; }
 void runtime_file_configure(const char *app0,const char *user) {
-    char path[512];
+    char path[600];
     snprintf(user_root,sizeof(user_root),"%s",user);
     runtime_file_mount("/app0",app0);
     runtime_file_mount("/hostapp",app0);
