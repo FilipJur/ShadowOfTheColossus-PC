@@ -11,7 +11,9 @@ Settings (environment variables, or sotc.ini beside this script as NAME=value li
     SOTC_SYS_MODULES  folder with YOUR OWN console's decrypted libSceNgs2.sprx and
                       libSceUlt.sprx (shadPS4's user/sys_modules). Without it the game is silent.
                       These files are Sony firmware: they are never distributed with the port.
-    SOTC_USER_DIR     saves, shader/pipeline caches; default ./user
+    SOTC_USER_DIR     saves, shader/pipeline caches; default <data>/user
+    SOTC_DATA_DIR     writable folder for sotc.ini, the prepared image (out/) and user/; default
+                      this folder (the AppImage sets ~/.local/share/sotc-pc)
     SOTC_UPDATE_DIR   optional: the game update; by default <game>-UPDATE or <game>-patch next to
                       the dump (as shadPS4); its files take the place of the base game's
     SOTC_DLC_DIR      optional: the game's DLC (one folder per add-on with sce_sys/param.sfo,
@@ -21,15 +23,16 @@ Settings (environment variables, or sotc.ini beside this script as NAME=value li
                       fps60 (removes the 30 FPS cap; experimental, vblank at 120 Hz),
                       fps60game (the game's own 60 FPS target, as the PS4 Pro Performance mode;
                       with SOTC_FPS_CAP=off)
+                      hdr (HDR10 output and the game's HDR rendering; Windows HDR must be on)
     SOTC_RENDER_RES   optional: the game renders at WxH instead of 1920x1080 (e.g. 2560x1080 for
                       21:9, a wider view); the output follows its aspect; PS4 mode only
     SOTC_CVARS        engine settings, NAME=VALUE separated by spaces (e.g. r_motionBlurEnable=0)
     BB_GAMEPAD        the gamepad to use (its name or part of it), when several are connected
     key.<input>=Keys, pad.<input>=buttons   remap the controls (README.md, Controles)
 The image is prepared again only when the game, the modules or the scripts change.
-Extra arguments go to bb-probe.exe. Run from a console, the session is also saved to
-<user>/last_run.log (the 4 before it as last_run.1.log ... last_run.4.log; a crash's log is
-copied to <user>/crashes).
+Extra arguments go to bb-probe (bb-probe.exe on Windows). On Linux: ./sotc.sh after ./build.sh.
+Run from a console, the session is also saved to <user>/last_run.log (the 4 before it as
+last_run.1.log ... last_run.4.log; a crash's log is copied to <user>/crashes).
 """
 import hashlib
 import os
@@ -39,6 +42,9 @@ import subprocess
 import sys
 
 PORT = Path(__file__).resolve().parent
+# Writable data (sotc.ini, out/, user/): the port's folder unless SOTC_DATA_DIR names another
+# (packaged builds such as the AppImage, whose own folder is read-only).
+DATA = Path(os.environ.get('SOTC_DATA_DIR') or PORT).resolve()
 SCRIPTS = PORT / 'scripts'
 SYS_MODULES = ('libSceUlt.sprx', 'libSceNgs2.sprx')
 
@@ -49,7 +55,7 @@ def fail(message):
 
 
 def load_ini():
-    ini = PORT / 'sotc.ini'
+    ini = DATA / 'sotc.ini'
     if ini.is_file():
         for line in ini.read_text(encoding='utf-8', errors='replace').splitlines():
             line = line.strip()
@@ -60,15 +66,18 @@ def load_ini():
 
 def no_console():
     """Started without a console (the launcher): console programs must not open their own."""
+    if os.name != 'nt':
+        return 0
     import ctypes
     return 0 if ctypes.windll.kernel32.GetConsoleWindow() else subprocess.CREATE_NO_WINDOW
 
 
 def find_probe():
-    for candidate in (PORT / 'bin' / 'bb-probe.exe', PORT / 'out' / 'bb-probe.exe'):
+    name = 'bb-probe.exe' if os.name == 'nt' else 'bb-probe'
+    for candidate in (PORT / 'bin' / name, PORT / 'out' / name):
         if candidate.is_file():
             return candidate
-    fail('bb-probe.exe not found: build it with build.sh (MSYS2 CLANG64) or use a packaged build.')
+    fail(f'{name} not found: build it with build.sh (MSYS2 CLANG64 on Windows) or use a packaged build.')
 
 
 def run_script(name, *args):
@@ -127,9 +136,9 @@ def merged_source(game, update, out):
 def main():
     load_ini()
     env = os.environ
-    os.chdir(PORT)
-    out = PORT / 'out'
-    out.mkdir(exist_ok=True)
+    DATA.mkdir(parents=True, exist_ok=True)
+    os.chdir(DATA)
+    out = DATA / 'out'
     # The EU dump (CUSA08809) next to the port, else the US one (CUSA08034).
     default = next((PORT.parent / g for g in ('CUSA08809', 'CUSA08034') if (PORT.parent / g / 'eboot.bin').is_file()),
                    PORT.parent / 'CUSA08809')
@@ -214,22 +223,29 @@ def main():
     # up to 30 FPS. With the cap, 120 Hz only shows a late frame sooner (and SOTC_FPS_LIMIT counts
     # in 120 Hz vblanks).
     env.setdefault('BB_VBLANK_HZ', '120')
+    if 'hdr' in modes.lower():
+        # HDR10 swapchain (Rec.2020 PQ, when Windows HDR is on); the game then offers HDR too.
+        env.setdefault('BB_HDR', '1')
 
     probe = find_probe()
     # Development builds run from the MSYS2 tree: its CLANG64 DLLs (SDL3, FFmpeg, ...).
-    if not (probe.parent / 'SDL3.dll').is_file():
+    if os.name == 'nt' and not (probe.parent / 'SDL3.dll').is_file():
         clang64 = Path(env.get('MSYS2_ROOT', r'C:\msys64')) / 'clang64' / 'bin'
         if clang64.is_dir():
             env['PATH'] = f'{clang64}{os.pathsep}{env.get("PATH", "")}'
-    user = Path(env.get('SOTC_USER_DIR', PORT / 'user')).resolve()
+    user = Path(env.get('SOTC_USER_DIR', DATA / 'user')).resolve()
     user.mkdir(parents=True, exist_ok=True)
     env.setdefault('BB_GPU_USER_DIR', str(user))
     # Controls: key.<input>= / pad.<input>= lines of sotc.ini remap keys and buttons (src/runtime_pad.c).
-    env.setdefault('BB_CONFIG', str(PORT / 'sotc.ini'))
+    env.setdefault('BB_CONFIG', str(DATA / 'sotc.ini'))
     command = [str(probe), str(out / 'boot-linked.bin'), '--content-profile', str(out / 'content.bin'),
                '--sotc-cpu', str(out / 'sotc-cpu.bin'), '--patches', str(out / 'patches.bin'),
                *(['--sotc-cmdline', str(out / 'cmdline.bin')] if (out / 'cmdline.bin').is_file() else []),
-               '--app0', str(game), '--user', str(user), *sys.argv[1:]]
+               '--app0', str(game), '--user', str(user),
+               # The Linux loader has a development watchdog (10 s by default) that ends the
+               # process with a stack dump; the game runs without it (BB_TIMEOUT=n for debugging).
+               *(['--timeout', env.get('BB_TIMEOUT', '0')] if os.name != 'nt' else []),
+               *sys.argv[1:]]
     # SOTC_WRAP: a JSON list put in front of the game, e.g. RenderDoc
     # ["C:/Program Files/RenderDoc/renderdoccmd.exe", "capture", "-w", "-c", "<file>"]; F12 then
     # captures the frame (SOTC_RDOC_SUBMITS submissions).
