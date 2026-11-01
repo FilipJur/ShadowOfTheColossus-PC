@@ -414,11 +414,11 @@ extern "C" int bbgpu_readbacks_mode(void) {
 // gabriel/linux-native). The video core's page_manager.cpp defines the real pair strongly
 // (slice 2 owns that file); these stubs only keep the link whole where it does not, and
 // always report "no state" so the loader falls back to its own protection handling.
-__attribute__((weak)) extern "C" int bbgpu_page_read_watched(uintptr_t address) {
+extern "C" __attribute__((weak)) int bbgpu_page_read_watched(uintptr_t address) {
     (void)address;
     return 0;
 }
-__attribute__((weak)) extern "C" int bbgpu_page_restore(uintptr_t address) {
+extern "C" __attribute__((weak)) int bbgpu_page_restore(uintptr_t address) {
     (void)address;
     return 0;
 }

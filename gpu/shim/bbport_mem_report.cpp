@@ -2,7 +2,6 @@
 #include <cstdint> // before the header: it uses uint64_t (frozen contract header)
 #include "bbport_mem_report.h"
 
-#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
