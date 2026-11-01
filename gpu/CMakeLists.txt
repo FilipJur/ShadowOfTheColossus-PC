@@ -186,6 +186,8 @@ add_host_shader(fg_depth.comp fg_depth_comp)
 add_host_shader(fg_ui.comp fg_ui_comp)
 add_host_shader(dlss_mvec_fill.comp dlss_mvec_fill_comp)
 add_host_shader(dlss_color_sanitize.comp dlss_color_sanitize_comp)
+add_host_shader(upscale_hud.comp upscale_hud_comp)
+add_host_shader(fsr3_reactive.comp fsr3_reactive_comp)
 foreach(BPP IN ITEMS 8 16 32 64 96 128)
     add_host_shader(tiling.comp tiling_micro_${BPP}_comp BITS_PER_PIXEL=${BPP} IS_MACRO_TILED=0)
     add_host_shader(tiling.comp tiling_macro_${BPP}_comp BITS_PER_PIXEL=${BPP} IS_MACRO_TILED=1)
@@ -231,10 +233,20 @@ target_include_directories(bbgpu PRIVATE third_party/stb)
 # DLSS Frame Generation (vk_dlssg.cpp): NVIDIA Streamline SDK headers (MIT); the DLLs are
 # loaded at run time from the executable's folder.
 target_include_directories(bbgpu PRIVATE third_party/streamline/include)
+# AMD FFX API Vulkan headers (vk_upscaler_ffxapi.cpp), vendored later at third_party/ffx-api-vk.
+if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ffx-api-vk)
+    target_include_directories(bbgpu PRIVATE third_party/ffx-api-vk)
+endif()
 # AMD FSR 3 frame generation (vk_fsrfg.cpp): the FidelityFX SDK 2.3 frame interpolation and
 # optical flow, natively on Vulkan (third_party/fsr-vulkan, MIT); any GPU with Vulkan 1.3.
 # (fsr-vulkan is added once above, with the frame generation options.)
 target_link_libraries(bbgpu PRIVATE ffx-vulkan::fsr3-vk-framegeneration-3.1.6)
+# AMD FSR 3.1 temporal upscaler (vk_fsr3up.cpp): its backend shares the bridge and the SDK core with the
+# frame generation above, linked after it so that those objects are taken from there.
+target_link_libraries(bbgpu PRIVATE ffx-vulkan::fsr3-vk-backend-3.1.5)
+set(FFX_2_3_0_KIT ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fsr-vulkan/upstream/ffx-2.3.0/Kits/FidelityFX)
+set_source_files_properties(sotc/sotc_fsr3up_blobs.cpp PROPERTIES INCLUDE_DIRECTORIES
+    "${FFX_2_3_0_KIT}/api/include;${FFX_2_3_0_KIT}/api/internal;${FFX_2_3_0_KIT}/upscalers/include;${FFX_2_3_0_KIT}/upscalers/fsr3/include;${FFX_2_3_0_KIT}/upscalers/fsr3/internal")
 # The module's 3.1.6 frame generation never starts a frame on its bridge: the constant buffers
 # and descriptor sets of every dispatch are then kept until the context is destroyed (~3 MB of
 # video memory per frame, out of memory within a minute). Its source is built from a copy that
