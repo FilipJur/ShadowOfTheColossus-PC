@@ -581,6 +581,8 @@ static int pool(void) {
     backing_base=view;
     return 0;
 }
+/* mmap(MAP_FIXED) replaces mappings in place: a live view is never split here (SOTC_FPS report). */
+uint64_t runtime_memory_carve_splits(void) { return 0; }
 void runtime_memory_reserve(void) {}
 static int host_map(uintptr_t address, uint64_t size, int prot, int reserved, uint64_t phys) {
     void *mapped = !reserved
