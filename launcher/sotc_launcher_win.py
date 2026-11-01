@@ -822,8 +822,8 @@ def game_environment(s):
     env['SOTC_MOUSE'] = '1' if s.get('mouse', True) else '0'
     env['SOTC_MOUSE_SENS'] = str(s.get('mouse_sens') or '1.0')
     env['SOTC_MOUSE_INVERT'] = '1' if s.get('mouse_invert') else '0'
-    # Hot readbacks (buffer_cache.cpp GatherDownloads): ~25% more FPS at the Shrine; off by
-    # default since they put rainbow garbage and crashes on reused memory before the late check.
+    # Hot readbacks (buffer_cache.cpp GatherDownloads): ~25% more FPS at the Shrine. On by default
+    # in the port (unset means on); SOTC_RB_HOT=0 via extra_env is the only way off.
     if s.get('rb_hot'):
         env['SOTC_RB_HOT'] = '1'
     # Bluepoint's debug menu (+RetailBuild=0 served by the port; the game files are not touched).
