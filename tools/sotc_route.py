@@ -65,6 +65,23 @@ wait 2
 '''
 
 
+def game_pids():
+    if os.name == 'nt':
+        return subprocess.run(['tasklist', '/FI', 'IMAGENAME eq bb-probe.exe'], capture_output=True, text=True).stdout.count('bb-probe.exe')
+    try:
+        out = subprocess.run(['pgrep', '-c', '-x', 'bb-probe'], capture_output=True, text=True).stdout.strip()
+        return int(out) if out else 0
+    except (OSError, ValueError):
+        return 0
+
+
+def end_game():
+    if os.name == 'nt':
+        subprocess.run(['taskkill', '/F', '/IM', 'bb-probe.exe'], capture_output=True)
+    else:
+        subprocess.run(['pkill', '-KILL', '-x', 'bb-probe'], capture_output=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--install', required=True, help='the port folder (launcher/, user/)')
@@ -95,7 +112,7 @@ def main():
     install = Path(args.install)
     user = install / 'user'
     saves = user / 'savedata' / '1' / 'CUSA08809'
-    if subprocess.run(['tasklist', '/FI', 'IMAGENAME eq bb-probe.exe'], capture_output=True, text=True).stdout.count('bb-probe.exe'):
+    if game_pids():
         print('INVALID: the game is running')
         return 1
     restore = None
@@ -163,8 +180,7 @@ def main():
 
 
 def running():
-    out = subprocess.run(['tasklist', '/FI', 'IMAGENAME eq bb-probe.exe'], capture_output=True, text=True).stdout
-    return 'bb-probe.exe' in out
+    return game_pids() > 0
 
 
 def drive(args, pad, log, launched, launcher):
@@ -194,7 +210,7 @@ def drive(args, pad, log, launched, launcher):
 
     def invalid(why):
         # Keep the failed run's log too: the next launch overwrites last_run.log.
-        subprocess.run(['taskkill', '/F', '/IM', 'bb-probe.exe'], capture_output=True)
+        end_game()
         try:
             keep = log.with_name(f'invalid-{time.strftime("%Y%m%d-%H%M%S")}.log')
             shutil.copy2(log, keep)
@@ -262,7 +278,7 @@ def drive(args, pad, log, launched, launcher):
                 wait(3)
         else:
             wait(args.measure)
-        subprocess.run(['taskkill', '/F', '/IM', 'bb-probe.exe'], capture_output=True)
+        end_game()
         launcher.wait(30)
         # The next launch overwrites last_run.log: keep this run's copy for spike_report.py.
         keep = log.with_name(f'measure-{time.strftime("%Y%m%d-%H%M%S")}.log')
@@ -284,7 +300,7 @@ def drive(args, pad, log, launched, launcher):
         print('INVALID: the game ended during the replay')
         return 1
     wait(3)
-    subprocess.run(['taskkill', '/F', '/IM', 'bb-probe.exe'], capture_output=True)
+    end_game()
     launcher.wait(30)
     print(f'replay done, log {log}')
     return 0
