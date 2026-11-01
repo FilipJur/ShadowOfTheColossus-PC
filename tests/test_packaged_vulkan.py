@@ -2,7 +2,6 @@
 from paths import ROOT
 import importlib.util
 import json
-import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -12,13 +11,11 @@ vulkan = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(vulkan)
 
 
-@unittest.skipIf(os.name == "nt", "bbport_vulkan is the Linux AppImage entry point: POSIX paths, "
-                 "':'-separated VK_DRIVER_FILES and LD_LIBRARY_PATH")
 class PackagedVulkanTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name).resolve()  # macOS: /var -> /private/var
+        self.root = Path(self.tmp.name)
         self.icds = self.root / "icds"
         self.libs = self.root / "host-libs"
         self.icds.mkdir()
