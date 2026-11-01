@@ -1,0 +1,39 @@
+modelRoles:
+  default: opencode-go/deepseek-v4.1-flash:high
+  plan: google-antigravity/gemini-4-argon:high
+  slow: google-antigravity/gemini-4-argon:high
+  worker: opencode-go/muse-spark-1.3-contributor:high
+  ui: google-antigravity/gemini-3.8-flash:high
+  task: opencode-go/deepseek-v4.1-flash:high
+  smol: opencode-go/deepseek-v4.1-flash:high
+  tiny: opencode-go/deepseek-v4.1-flash:high
+  commit: opencode-go/deepseek-v4.1-flash:low
+  advisor: google-antigravity/gemini-4-argon:medium
+  judge: opencode-zen/jev-1.13:low
+retry:
+  modelFallback: true
+  fallbackChains:
+    default: [google-antigravity/gemini-4-argon-medium:high, opencode-go/deepseek-v4.1-flash:high]
+    plan: [google-antigravity/gemini-4-argon-medium:high, opencode-go/deepseek-v4.1-flash:high]
+    slow: [google-antigravity/gemini-3.8-flash:high, opencode-go/deepseek-v4.1-flash:high]
+    worker: [opencode-go/deepseek-v4.1-flash:high, google-antigravity/gemini-3.8-flash:high]
+    ui: [opencode-go/deepseek-v4.1-flash:high]
+    task: [opencode-go/muse-spark-1.3-contributor:high, google-antigravity/gemini-3.8-flash:high]
+    smol: [opencode-go/deepseek-v4.1-flash:low]
+    advisor: [opencode-go/deepseek-v4.1-flash:high]
+    judge: [opencode-zen/jev-1.13]
+prewalk: { enabled: false }
+task:
+  prewalk: false
+  maxRecursionDepth: 2
+  agentModelOverrides:
+    task: "@task"
+    scout: "@task"
+    sonic: "@task"
+    reviewer: "@task"
+  isolation:
+    merge: branch
+    apply: false
+  softRequestBudget: 600
+display:
+  subagentLivePreview: true

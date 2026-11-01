@@ -1,0 +1,7 @@
+maxNotesPerUpdate: 2
+advisors:
+  - name: Lead rules
+    model: "@advisor"
+    reviewMode: turn
+    reviewInterval: 4
+    syncBacklog: off
