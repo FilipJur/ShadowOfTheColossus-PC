@@ -50,7 +50,7 @@ public:
     virtual const char* Name() const = 0; // e.g. "FSR 3.1 (built-in)"
     virtual bool Init(const Instance& instance) = 0; // false = unavailable on this device/host
     virtual bool Dispatch(vk::CommandBuffer cmdbuf, const Inputs& in, const Resource& output) = 0;
-    virtual i32 JitterPhaseCount(u32 render_width, u32 output_width) const = 0;
+    virtual s32 JitterPhaseCount(u32 render_width, u32 output_width) const = 0;
     virtual void Shutdown() = 0;
 };
 
