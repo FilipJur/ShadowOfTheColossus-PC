@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include <cstdint> // before the header: it uses uint64_t (frozen contract header)
 #include "bbport_mem_report.h"
+
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -11,9 +17,6 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <unordered_map>
 #include <utility>
