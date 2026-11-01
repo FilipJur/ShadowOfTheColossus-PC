@@ -453,7 +453,9 @@ static DWORD WINAPI hang_watchdog(void *unused) {
 /* sotc: SOTC_PROFILE=<thread name part>: samples that thread every ~1 ms (SuspendThread +
  * GetThreadContext) from SOTC_PROFILE_DELAY (default 20) s for SOTC_PROFILE_SECONDS (default 15)
  * s, then prints the hottest instructions (leaf) and the hottest frames anywhere on the
- * frame-pointer chain (inclusive). exe offsets: llvm-symbolizer on out/gpu/bb-probe.exe. */
+ * frame-pointer chain (inclusive). exe offsets: llvm-symbolizer on out/gpu/bb-probe.exe.
+ * SOTC_PROFILE_SLOW_MS=<ms>: only the samples of frames (flip to flip) longer than that count;
+ * the samples of each frame wait until its flip decides (what a stutter frame spends time on). */
 #define PROFILE_SLOTS 65536
 typedef struct { uintptr_t address; unsigned leaf, inclusive; } ProfileSlot;
 static ProfileSlot *profile_slots;
@@ -476,6 +478,30 @@ static void profile_pair(uintptr_t exe, uintptr_t leaf, uintptr_t caller) {
         if (p->leaf==leaf && p->caller==caller) { ++p->count; return; }
     }
 }
+/* SOTC_PROFILE_SLOW_MS: the current frame's samples, kept until its flip. */
+typedef struct { uintptr_t address, caller; int kind; } ProfilePending; /* 1 leaf, 0 caller, 2 pair */
+#define PROFILE_PENDING 262144
+static ProfilePending *profile_pending;
+static size_t profile_pending_count;
+static int profile_slow_ms;
+static void profile_note(uintptr_t address, int leaf) {
+    if (!profile_slow_ms) { profile_add(address,leaf); return; }
+    if (profile_pending_count<PROFILE_PENDING)
+        profile_pending[profile_pending_count++]=(ProfilePending){address,0,leaf};
+}
+static void profile_note_pair(uintptr_t exe, uintptr_t leaf, uintptr_t caller) {
+    if (!profile_slow_ms) { profile_pair(exe,leaf,caller); return; }
+    if (profile_pending_count<PROFILE_PENDING)
+        profile_pending[profile_pending_count++]=(ProfilePending){leaf,caller,2};
+}
+static void profile_settle(int keep) {
+    for (size_t i=0; keep && i<profile_pending_count; ++i) {
+        const ProfilePending *p=&profile_pending[i];
+        if (p->kind==2) profile_pair(0,p->address,p->caller);
+        else profile_add(p->address,p->kind);
+    }
+    profile_pending_count=0;
+}
 static int profile_by_pair(const void *a, const void *b) {
     return (int)((const ProfilePair *)b)->count-(int)((const ProfilePair *)a)->count;
 }
@@ -484,6 +510,60 @@ static int profile_by_leaf(const void *a, const void *b) {
 }
 static int profile_by_inclusive(const void *a, const void *b) {
     return (int)((const ProfileSlot *)b)->inclusive-(int)((const ProfileSlot *)a)->inclusive;
+}
+/* sotc: SOTC_THREAD_TIMES=1: per-thread CPU time over the profile window (SOTC_PROFILE_DELAY to
+ * +SOTC_PROFILE_SECONDS), with the flip count, to see which thread gains or loses busy time
+ * between two flip modes without picking a thread up front. */
+typedef struct { DWORD id; ULONGLONG cycles; char name[32]; } ThreadTimeRow;
+static int thread_times_snapshot(ThreadTimeRow *rows, int max) {
+    typedef HRESULT (WINAPI *Describe)(HANDLE, PWSTR *);
+    static Describe describe;
+    if (!describe) describe=(Describe)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"),"GetThreadDescription");
+    int n=0;
+    HANDLE snapshot=CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0);
+    THREADENTRY32 te={.dwSize=sizeof(te)};
+    for (BOOL ok=Thread32First(snapshot,&te); ok && n<max; ok=Thread32Next(snapshot,&te)) {
+        if (te.th32OwnerProcessID!=GetCurrentProcessId()) continue;
+        HANDLE t=OpenThread(THREAD_QUERY_LIMITED_INFORMATION,FALSE,te.th32ThreadID);
+        if (!t) continue;
+        ThreadTimeRow *r=&rows[n];
+        r->id=te.th32ThreadID; r->name[0]=0;
+        if (!QueryThreadCycleTime(t,&r->cycles)) r->cycles=0;
+        PWSTR text=NULL;
+        if (describe && SUCCEEDED(describe(t,&text)) && text) {
+            WideCharToMultiByte(CP_UTF8,0,text,-1,r->name,sizeof(r->name),NULL,NULL);
+            LocalFree(text);
+        }
+        CloseHandle(t); ++n;
+    }
+    CloseHandle(snapshot);
+    return n;
+}
+static DWORD WINAPI thread_times(void *unused) {
+    (void)unused;
+    const char *delay=getenv("SOTC_PROFILE_DELAY"), *seconds=getenv("SOTC_PROFILE_SECONDS");
+    Sleep((delay ? atoi(delay) : 20)*1000);
+    static ThreadTimeRow before[256], after[256];
+    const uint64_t flips0=bbgpu_flip_count();
+    const int nb=thread_times_snapshot(before,256);
+    const ULONGLONG t0=GetTickCount64();
+    Sleep((seconds ? atoi(seconds) : 15)*1000);
+    const int na=thread_times_snapshot(after,256);
+    const double ms=(double)(GetTickCount64()-t0);
+    const uint64_t frames=bbgpu_flip_count()-flips0;
+    fprintf(stderr,"SOTC thread times: %.0f ms, %llu flips\n",ms,(unsigned long long)frames);
+    for (int i=0;i<na;++i) {
+        ULONGLONG start=0;
+        for (int j=0;j<nb;++j) if (before[j].id==after[i].id) { start=before[j].cycles; break; }
+        if (after[i].cycles<=start) continue;
+        /* Cycles, not time; report both raw and per-flip so two runs compare by share. */
+        const double mcycles=(double)(after[i].cycles-start)/1e6;
+        if (mcycles<1.0) continue;
+        fprintf(stderr,"  tid %6lu %-32s %10.1f Mcycles  %8.3f Mc/flip\n",
+                (unsigned long)after[i].id,after[i].name[0]?after[i].name:"?",
+                mcycles,frames?mcycles/(double)frames:0.0);
+    }
+    return 0;
 }
 static DWORD WINAPI profiler(void *name) {
     typedef HRESULT (WINAPI *Describe)(HANDLE, PWSTR *);
@@ -509,16 +589,27 @@ static DWORD WINAPI profiler(void *name) {
     if (!target) { fprintf(stderr,"SOTC profile: no thread named like %s\n",(const char *)name); return 0; }
     HANDLE thread=OpenThread(THREAD_SUSPEND_RESUME|THREAD_GET_CONTEXT|THREAD_QUERY_INFORMATION,FALSE,target);
     profile_slots=calloc(PROFILE_SLOTS,sizeof(*profile_slots));
-    if (!thread || !profile_slots) return 0;
+    if (getenv("SOTC_PROFILE_SLOW_MS")) profile_slow_ms=atoi(getenv("SOTC_PROFILE_SLOW_MS"));
+    if (profile_slow_ms) profile_pending=calloc(PROFILE_PENDING,sizeof(*profile_pending));
+    if (!thread || !profile_slots || (profile_slow_ms && !profile_pending)) return 0;
     const ULONGLONG end=GetTickCount64()+(ULONGLONG)(seconds ? atoi(seconds) : 15)*1000;
-    unsigned samples=0;
+    unsigned samples=0, frame_samples=0, slow_frames=0;
+    uint64_t frame_flips=bbgpu_flip_count();
+    ULONGLONG frame_start=GetTickCount64();
     timeBeginPeriod(1);
     while (GetTickCount64()<end) {
+        if (profile_slow_ms && bbgpu_flip_count()!=frame_flips) {
+            const ULONGLONG now=GetTickCount64();
+            const int slow=now-frame_start>=(ULONGLONG)profile_slow_ms;
+            profile_settle(slow);
+            if (slow) { samples+=frame_samples; ++slow_frames; }
+            frame_samples=0; frame_flips=bbgpu_flip_count(); frame_start=now;
+        }
         if (SuspendThread(thread)!=(DWORD)-1) {
             CONTEXT c={.ContextFlags=CONTEXT_CONTROL|CONTEXT_INTEGER};
             if (GetThreadContext(thread,&c)) {
-                ++samples;
-                profile_add((uintptr_t)c.Rip,1);
+                if (profile_slow_ms) ++frame_samples; else ++samples;
+                profile_note((uintptr_t)c.Rip,1);
                 const uintptr_t leaf=(uintptr_t)c.Rip;
                 int first_own=1;
                 /* sotc: RtlVirtualUnwind on a snapshot taken mid-prologue can read a garbage
@@ -542,13 +633,13 @@ static DWORD WINAPI profiler(void *name) {
                         c.Rip=ret; c.Rsp+=8;
                     }
                     if (!c.Rip) break;
-                    profile_add((uintptr_t)c.Rip,0);
+                    profile_note((uintptr_t)c.Rip,0);
                     /* The first frame in the loader/GPU library that leads to a system leaf:
                      * who waits, locks or calls the driver. */
                     if (first_own && (uintptr_t)c.Rip-(uintptr_t)GetModuleHandleA(NULL)<0x4000000 &&
                         leaf-(uintptr_t)GetModuleHandleA(NULL)>=0x4000000) {
                         first_own=0;
-                        profile_pair((uintptr_t)GetModuleHandleA(NULL),leaf,(uintptr_t)c.Rip);
+                        profile_note_pair((uintptr_t)GetModuleHandleA(NULL),leaf,(uintptr_t)c.Rip);
                     }
                 }
                 runtime_fault_recover=NULL;
@@ -560,6 +651,8 @@ static DWORD WINAPI profiler(void *name) {
     timeEndPeriod(1);
     char where[MAX_PATH+64];
     fprintf(stderr,"SOTC profile of %s: %u samples\n",(const char *)name,samples);
+    if (profile_slow_ms) fprintf(stderr,"SOTC profile: %u frames over %d ms\n",slow_frames,profile_slow_ms);
+    if (!samples) return 0;
     /* SOTC_PROFILE_OUT=<file>: every sampled address (module offset, leaf, inclusive), for
      * per-function totals offline (tools/profile_sym.py --functions). */
     if (getenv("SOTC_PROFILE_OUT")) {
@@ -1098,6 +1191,135 @@ static void choose_tsc(void) {
 #endif
 /* sotc: SSE4a and red-zone patches of the eboot (gpu/sotc), described by scripts/sotc_cpu.py. */
 #define SOTC_TRAMPOLINE_SIZE (UINT64_C(16) << 20)
+#ifndef _WIN32
+/* sotc (Linux): counterparts of the Windows exception paths above.
+ * The image below 2 GiB: Shadow of the Colossus packs pointers to its static data into 31 bits.
+ * The range is claimed at the start of main, top down from 2 GiB so the non-PIE loader's brk
+ * heap (growing up from just above 0x400000) keeps its room. */
+#define EBOOT_MIN UINT64_C(0x10000000)
+#define EBOOT_LIMIT UINT64_C(0x80000000)
+#define EBOOT_RESERVATION (UINT64_C(256) << 20)
+static void *eboot_reservation;
+static void reserve_eboot_range(void) {
+    for (uintptr_t at=EBOOT_LIMIT-EBOOT_RESERVATION; at>=EBOOT_MIN; at-=UINT64_C(16)<<20) {
+        void *p=mmap((void *)at,EBOOT_RESERVATION,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE|MAP_FIXED_NOREPLACE,-1,0);
+        if (p!=MAP_FAILED) { eboot_reservation=p; return; }
+    }
+}
+static void *allocate_image(size_t size) {
+    if (!eboot_reservation) fail("no free 256 MiB range below 2 GiB for the eboot");
+    if (size > EBOOT_RESERVATION) fail("the image does not fit the eboot reservation");
+    if (mprotect(eboot_reservation,size,PROT_READ|PROT_WRITE)) fail("cannot commit the eboot range");
+    printf("Image at %p (below 2 GiB, as the game's 31-bit pointers need)\n",eboot_reservation);
+    return eboot_reservation;
+}
+/* BPE heap guard (see the Windows version): int3 on the heap's free function, single step to
+ * put it back. On Linux int3 reports RIP after the breakpoint byte. */
+#define HEAP_FREE_OFFSET 0x495e0
+#define HEAP_HOOK_CALLS 2000
+#define TRAP_FLAG 0x100
+const unsigned char *runtime_memory_backing_pointer(uintptr_t address);
+static unsigned char heap_hook_original;
+static int heap_hook_calls, heap_hook_done, heap_hook_lock;
+static __thread int heap_hook_rearm;
+static struct { uintptr_t heap; int count; } heap_seen[8];
+static volatile uintptr_t heap_chosen;
+static void heap_hook_write(unsigned char value) {
+    unsigned char *at=image+HEAP_FREE_OFFSET;
+    void *page=(void *)((uintptr_t)at&~(uintptr_t)(page_size-1));
+    while (__atomic_exchange_n(&heap_hook_lock,1,__ATOMIC_ACQUIRE)) __builtin_ia32_pause();
+    if (!mprotect(page,page_size,PROT_READ|PROT_WRITE|PROT_EXEC)) {
+        __atomic_store_n(at,value,__ATOMIC_SEQ_CST);
+        mprotect(page,page_size,PROT_READ|PROT_EXEC);
+    }
+    __atomic_store_n(&heap_hook_lock,0,__ATOMIC_RELEASE);
+}
+static void install_heap_hook(void) {
+    static const unsigned char expected[8]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56};
+    const char *v=getenv("SOTC_HEAP_GUARD");
+    if ((v && v[0]=='0') || memcmp(image+HEAP_FREE_OFFSET,expected,sizeof(expected))) return;
+    heap_hook_original=image[HEAP_FREE_OFFSET];
+    image[HEAP_FREE_OFFSET]=0xCC; /* the image is still writable here */
+}
+static void choose_heap(void) {
+    uintptr_t best=0; int best_count=0;
+    for (int i=0;i<8;++i) {
+        uint64_t size=0;
+        const unsigned char *backing=heap_seen[i].heap ? runtime_memory_backing_pointer(heap_seen[i].heap+0x30) : NULL;
+        if (backing) memcpy(&size,backing,8);
+        else if (heap_seen[i].heap-(uintptr_t)image<0x20000000) memcpy(&size,(const void *)(heap_seen[i].heap+0x30),8);
+        if (heap_seen[i].heap && size>=0x1000000 && size<0x100000000ull && heap_seen[i].count>best_count) {
+            best=heap_seen[i].heap; best_count=heap_seen[i].count;
+        }
+    }
+    heap_chosen=best;
+    fprintf(stderr,"Runtime: BPE heap guard on heap %p (%d of %d frees)\n",(void *)best,best_count,HEAP_HOOK_CALLS);
+}
+uintptr_t runtime_sotc_heap(void) { return heap_chosen; }
+/* The engine's heap table (#146, see the Windows version). */
+#define HEAP_TABLE_OFFSET 0x2dfaab0
+uintptr_t runtime_sotc_heap_table(void) { return heap_chosen ? (uintptr_t)(image+HEAP_TABLE_OFFSET) : 0; }
+static int heap_hook_trap(ucontext_t *uc) {
+    greg_t *g=uc->uc_mcontext.gregs;
+    /* The single step comes first: after the restored push rbp (1 byte) RIP is the hook + 1,
+     * exactly where an int3 would leave it. */
+    if (heap_hook_rearm) {
+        heap_hook_rearm=0;
+        if (!__atomic_load_n(&heap_hook_done,__ATOMIC_ACQUIRE)) heap_hook_write(0xCC);
+        g[REG_EFL]&=~(greg_t)TRAP_FLAG;
+        return 1;
+    }
+    if (image && (uintptr_t)g[REG_RIP]-1==(uintptr_t)(image+HEAP_FREE_OFFSET)) {
+        g[REG_RIP]-=1;
+        if (image[HEAP_FREE_OFFSET]!=0xCC) return 1; /* another thread restored it: just run it */
+        const uintptr_t heap=(uintptr_t)g[REG_RDI];
+        for (int i=0;i<8;++i) {
+            if (__atomic_load_n(&heap_seen[i].heap,__ATOMIC_ACQUIRE)==heap) { __atomic_add_fetch(&heap_seen[i].count,1,__ATOMIC_RELAXED); break; }
+            uintptr_t empty=0;
+            if (__atomic_compare_exchange_n(&heap_seen[i].heap,&empty,heap,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) {
+                __atomic_add_fetch(&heap_seen[i].count,1,__ATOMIC_RELAXED); break;
+            }
+        }
+        heap_hook_write(heap_hook_original);
+        if (__atomic_add_fetch(&heap_hook_calls,1,__ATOMIC_ACQ_REL)>=HEAP_HOOK_CALLS) {
+            if (!__atomic_exchange_n(&heap_hook_done,1,__ATOMIC_ACQ_REL)) choose_heap();
+        } else {
+            heap_hook_rearm=1;
+            g[REG_EFL]|=TRAP_FLAG; /* put the breakpoint back after this instruction */
+        }
+        return 1;
+    }
+    return 0;
+}
+/* Helper threads reading a page the tracker read-protected (precise readbacks): the page is
+ * opened for the one faulting instruction, as on Windows, and the tracker's own protection is
+ * put back on the single-step trap (the page manager decides it under its page lock). */
+static __thread uintptr_t step_page;
+static int helper_read_fault(siginfo_t *info, ucontext_t *uc) {
+    if ((uc->uc_mcontext.gregs[REG_ERR]&2) || info->si_code!=SEGV_ACCERR || step_page ||
+        runtime_thread_is_guest() || bbgpu_is_gpu_side_thread() || bbgpu_readbacks_mode()!=2) return 0;
+    const uintptr_t page=(uintptr_t)info->si_addr&~(uintptr_t)4095;
+    if (!bbgpu_page_read_watched(page) || mprotect((void *)page,4096,PROT_READ)) return 0;
+    step_page=page;
+    uc->uc_mcontext.gregs[REG_EFL]|=TRAP_FLAG;
+    return 1;
+}
+static int helper_single_step(ucontext_t *uc) {
+    if (!step_page) return 0;
+    const uintptr_t page=step_page;
+    step_page=0;
+    if (!bbgpu_page_restore(page)) mprotect((void *)page,4096,PROT_NONE);
+    uc->uc_mcontext.gregs[REG_EFL]&=~(greg_t)TRAP_FLAG;
+    return 1;
+}
+static void trap(int sig, siginfo_t *info, void *context) {
+    (void)sig; (void)info;
+    if (heap_hook_trap(context) || helper_single_step(context)) return;
+    const char line[]="Unexpected SIGTRAP\n";
+    { ssize_t written_=write(2,line,sizeof(line)-1); (void)written_; }
+    _exit(128+SIGTRAP);
+}
+#endif
 static void apply_sotc_cpu_patches(const char *path, const Segment *segments, uint64_t count, uint64_t size) {
     FILE *f=fopen(path,"rb");
     char magic[8];
@@ -1152,9 +1374,13 @@ static void apply_sotc_cmdline(const char *path, uint64_t size) {
     printf("Engine command line: %s\n",text);
 }
 #ifndef _WIN32
+static void dump_frames(ucontext_t *uc);
 static void fault(int sig, siginfo_t *info, void *context) {
     /* GPU page tracking (write-protected guest pages) is resolved first. */
+    if (sig == SIGSEGV && gpu_enabled && helper_read_fault(info, context)) return;
     if (gpu_enabled && sig == SIGSEGV && bbgpu_handle_fault(context, info->si_addr)) return;
+    /* sotc: an SSE4a site the load-time patchers could not rewrite is interpreted. */
+    if (sig == SIGILL && image && sotc_handle_illegal(context)) return;
     /* A speculative guest memory read (runtime_memory.c) failed: resume its recovery point. */
     if ((sig == SIGSEGV || sig == SIGBUS) && runtime_fault_recover) {
         sigjmp_buf *recover = runtime_fault_recover;
@@ -1179,7 +1405,20 @@ static void fault(int sig, siginfo_t *info, void *context) {
     else
         snprintf(line, sizeof(line), "Fault (signal %d) at RIP %p, address %p\n", sig, (void *)rip, info->si_addr);
     { ssize_t written_=write(2, line, strlen(line)); (void)written_; }
+    const greg_t *r = uc->uc_mcontext.gregs;
+    snprintf(line, sizeof(line),
+             "  rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx\n  rsi=%016llx rdi=%016llx rbp=%016llx rsp=%016llx\n"
+             "  r8=%016llx r9=%016llx r10=%016llx r11=%016llx\n  r12=%016llx r13=%016llx r14=%016llx r15=%016llx\n",
+             (unsigned long long)r[REG_RAX], (unsigned long long)r[REG_RBX], (unsigned long long)r[REG_RCX],
+             (unsigned long long)r[REG_RDX], (unsigned long long)r[REG_RSI], (unsigned long long)r[REG_RDI],
+             (unsigned long long)r[REG_RBP], (unsigned long long)r[REG_RSP], (unsigned long long)r[REG_R8],
+             (unsigned long long)r[REG_R9], (unsigned long long)r[REG_R10], (unsigned long long)r[REG_R11],
+             (unsigned long long)r[REG_R12], (unsigned long long)r[REG_R13], (unsigned long long)r[REG_R14],
+             (unsigned long long)r[REG_R15]);
+    { ssize_t written_=write(2, line, strlen(line)); (void)written_; }
     if (gpu_enabled) bbgpu_dump_guest_writes(context);
+    /* Guest rbp chain (the game keeps frame pointers); the host backtrace below stops at guest frames. */
+    dump_frames(uc);
     /* Host call chain (frames with unwind info; guest frames end it). */
     void *frames[32];
     int depth = backtrace(frames, 32);
@@ -1339,9 +1578,7 @@ void runtime_restart(void) {
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
-#ifdef _WIN32
     reserve_eboot_range();
-#endif
 #ifndef _WIN32
     /* Keep host heap objects handed to the guest (thread handles, TLS) in the
        non-PIE brk heap, i.e. below 1 TiB: the guest packs pointers into 40 bits. */
@@ -1415,6 +1652,7 @@ int main(int argc, char **argv) {
     if (getenv("SOTC_PROFILE"))
         CreateThread(NULL,0,strcmp(getenv("SOTC_PROFILE"),"*") ? profiler : profiler_all,
                      (void *)getenv("SOTC_PROFILE"),0,NULL);
+    if (getenv("SOTC_THREAD_TIMES")) CreateThread(NULL,0,thread_times,NULL,0,NULL);
     SetUnhandledExceptionFilter(unhandled_fault);
     if (getenv("BB_STRICT_HANDLES")) {
         PROCESS_MITIGATION_STRICT_HANDLE_CHECK_POLICY strict={0};
@@ -1426,9 +1664,14 @@ int main(int argc, char **argv) {
     (void)timeout_seconds; /* no watchdog on Windows */
 #else
     page_size = (size_t)sysconf(_SC_PAGESIZE);
-    struct sigaction sa = {0}; sa.sa_sigaction = fault; sa.sa_flags = SA_SIGINFO;
+    /* sotc: fiber stacks are packed back to back without guard pages; faults run on a
+     * per-thread alternate stack (runtime_thread_signal_stack, also called by guest threads). */
+    runtime_thread_signal_stack();
+    struct sigaction sa = {0}; sa.sa_sigaction = fault; sa.sa_flags = SA_SIGINFO|SA_ONSTACK;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, NULL); sigaction(SIGILL, &sa, NULL); sigaction(SIGBUS, &sa, NULL);
+    struct sigaction trap_action = {0}; trap_action.sa_sigaction = trap; trap_action.sa_flags = SA_SIGINFO|SA_ONSTACK;
+    sigemptyset(&trap_action.sa_mask); sigaction(SIGTRAP, &trap_action, NULL);
     Dl_info self_info;
     if (dladdr((void *)main,&self_info)) exe_base=(uintptr_t)self_info.dli_fbase;
     struct sigaction dump = {0}; dump.sa_sigaction = thread_dump; dump.sa_flags = SA_SIGINFO|SA_RESTART;
@@ -1536,11 +1779,7 @@ int main(int argc, char **argv) {
         }
     }
     /* sotc: the CPU patch trampolines follow the image (rel32 jumps reach them). */
-#ifdef _WIN32
     image = allocate_image(round_page(size) + SOTC_TRAMPOLINE_SIZE);
-#else
-    image = allocate(round_page(size) + SOTC_TRAMPOLINE_SIZE);
-#endif
     if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
     fclose(f);
     if (!cpu_only) {

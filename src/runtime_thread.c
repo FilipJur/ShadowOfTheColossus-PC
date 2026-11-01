@@ -20,6 +20,7 @@
 #else
 #include <sys/syscall.h>
 #include <sys/mman.h>
+#include <signal.h>
 #include <asm/prctl.h>
 #endif
 #define ERR(n) ((int32_t)(UINT32_C(0x80020000)|(n)))
@@ -120,7 +121,22 @@ static void set_gs(void *base) {
 #define tls_block_alloc(size) aligned_alloc(64,size)
 #endif
 /* Build TCB/static TLS for the calling host thread and point GS at it. */
+/* sotc (Linux): signal handlers (GPU page tracking faults, int3/single-step traps) need far
+ * more stack than the game's fiber stacks have, and those are packed back to back without
+ * guard pages: every thread that runs guest code gets a 512 KiB alternate signal stack. */
+void runtime_thread_signal_stack(void) {
+#ifndef _WIN32
+    static __thread void *alt;
+    if (alt) return;
+    const size_t size=512*1024;
+    alt=mmap(NULL,size,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    if (alt==MAP_FAILED) { alt=NULL; return; }
+    stack_t ss={.ss_sp=alt,.ss_size=size,.ss_flags=0};
+    if (sigaltstack(&ss,NULL)) { munmap(alt,size); alt=NULL; }
+#endif
+}
 static void attach(GuestThread *t) {
+    runtime_thread_signal_stack();
     uint64_t offset=tls_offset();
     size_t total=offset+256;
     unsigned char *block=tls_block_alloc((total+63)&~(size_t)63);
@@ -158,13 +174,16 @@ GuestThread *runtime_thread_current(void) {
 }
 /* Host threads that call guest code (HLE decoders invoking guest callbacks) need
  * a TCB/TLS like guest threads; the record lives until process exit. */
+static void set_host_name(const char *name);
 void runtime_thread_attach_host(const char *name) {
     GuestThread *t=runtime_thread_current();
     snprintf(t->name,sizeof(t->name),"%s",name ? name : "host");
+    set_host_name(t->name);
 }
 void runtime_thread_attach_main(void) {
     GuestThread *t=runtime_thread_current();
     snprintf(t->name,sizeof(t->name),"main");
+    set_host_name(t->name);
 }
 static GuestThread *find_thread(void *handle) {
     GuestThread *found=NULL;
@@ -280,6 +299,23 @@ static void set_host_name(const char *name) {
     char host[16]={0};
     memcpy(host,name,strnlen(name,sizeof(host)-1));
     pthread_setname_np(pthread_self(),host);
+#ifdef _WIN32
+    /* sotc: also publish the name as the Win32 thread description, so the sampling profiler
+     * (SOTC_PROFILE matches GetThreadDescription) can pick guest threads by name. */
+    typedef HRESULT (WINAPI *SetDescription)(HANDLE,PCWSTR);
+    static SetDescription set_description;
+    static int looked;
+    if (!looked) {
+        set_description=(SetDescription)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"),
+                                                               "SetThreadDescription");
+        looked=1;
+    }
+    if (set_description) {
+        wchar_t wide[16];
+        for (int i=0;i<16;++i) wide[i]=(unsigned char)host[i];
+        set_description(GetCurrentThread(),wide);
+    }
+#endif
 }
 #ifdef _WIN32
 #define exit_setjmp(t) bb_setjmp((t)->exit_jump)
@@ -401,6 +437,9 @@ static ABI int32_t thread_rename(GuestThread *t,const char *name) {
     if (!name) return ERR(22);
     snprintf(t->name,sizeof(t->name),"%s",name);
     if (t==current) set_host_name(t->name);
+#ifdef _WIN32
+    if (getenv("SOTC_THREAD_IDS")) fprintf(stderr,"Runtime: guest thread renamed to '%s'\n",t->name);
+#endif
     return 0;
 }
 static ABI int32_t thread_equal(GuestThread *a,GuestThread *b) { return a==b; }
