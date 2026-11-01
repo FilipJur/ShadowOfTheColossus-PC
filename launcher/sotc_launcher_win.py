@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""Shadow of the Colossus launcher for Windows (Tkinter), modelled on bbport_launcher_win.py.
+"""Shadow of the Colossus launcher for Windows and Linux (Tkinter), modelled on bbport_launcher_win.py.
 
 One window for the port's settings: the game dump, the user's own sound modules, saves, modes
 (16x AF, 60 FPS), display and diagnostics. They go to sotc.py as environment variables.
-Launcher options live in %APPDATA%/sotc-launcher/settings.json.
+Launcher options live in user/launcher_settings.json of the data folder: the port's folder, or
+SOTC_DATA_DIR (the Linux AppImage sets it, its own folder being read-only).
 
 Frozen with PyInstaller (packaging/windows/package_sotc.sh) the same SotC.exe also runs the
 game without the window (`--play`), sotc.py (`--run`) and the preparation scripts (`--script`),
-so a packaged port needs no Python installation.
+so a packaged port needs no Python installation. The Linux AppImage carries its own Python with
+Tk (packaging/linux/build_appimage.sh) and starts this script.
 """
 import ctypes
 import json
@@ -18,6 +20,7 @@ from pathlib import Path
 import queue
 import runpy
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -26,7 +29,10 @@ import time
 import sotc_update
 
 FROZEN = getattr(sys, 'frozen', False)
+IS_WINDOWS = os.name == 'nt'
 PORT_DIR = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent.parent
+# Writable data (sotc.ini, user/), as sotc.py: the port's folder unless SOTC_DATA_DIR names another.
+DATA_DIR = Path(os.environ.get('SOTC_DATA_DIR') or PORT_DIR)
 sys.path.insert(0, str(PORT_DIR / 'scripts'))
 # Settings of the copy the launcher runs from, in its user folder (kept by updates): each copy
 # of the port has its own saves, caches and logs. Before 0.59.2 every copy shared
@@ -34,7 +40,7 @@ sys.path.insert(0, str(PORT_DIR / 'scripts'))
 # set up first.
 LEGACY_CONFIG_DIR = Path(os.environ.get('APPDATA', Path.home())) / 'sotc-launcher'
 LEGACY_CONFIG_FILE = LEGACY_CONFIG_DIR / 'settings.json'
-CONFIG_DIR = PORT_DIR / 'user'
+CONFIG_DIR = DATA_DIR / 'user'
 CONFIG_FILE = CONFIG_DIR / 'launcher_settings.json'
 # The supported releases (title ID -> region, version) share one eboot build; scripts/ is on
 # sys.path above. The EU one (CUSA08809) is the default game folder.
@@ -44,6 +50,9 @@ SYS_MODULES = ('libSceUlt.sprx', 'libSceNgs2.sprx')
 VERSION = '0.70'
 MAX_LOG_LINES = 6000
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+# The game process (sotc.py and the bb-probe it starts): a Windows job holds both (GameJob); on
+# Linux they get their own process group, which Stop ends.
+GAME_PROCESS_FLAGS = {'creationflags': NO_WINDOW} if IS_WINDOWS else {'start_new_session': True}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -51,6 +60,8 @@ NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
 def attach_stdio():
     """A windowed executable starts without sys.stdout; inherited pipes or a console still exist."""
+    if not IS_WINDOWS:  # a POSIX process always has its inherited standard streams
+        return
     import msvcrt
     for name, std in (('stdout', -11), ('stderr', -12)):
         if getattr(sys, name) is not None:
@@ -146,7 +157,16 @@ def title_font():
     return {'zh': 'Microsoft YaHei UI', 'ko': 'Malgun Gothic'}.get(LANG, 'Georgia')
 
 
+UI_LANGUAGE_CODES = ('pt', 'es', 'zh', 'ko', 'ru')
+
+
 def windows_language():
+    """The system's interface language among the launcher's, else English. On Linux, the locale
+    (LC_ALL, LC_MESSAGES, LANG, e.g. pt_BR.UTF-8)."""
+    if not IS_WINDOWS:
+        locale = next((os.environ[name] for name in ('LC_ALL', 'LC_MESSAGES', 'LANG') if os.environ.get(name)), '')
+        code = locale[:2].lower()
+        return code if code in UI_LANGUAGE_CODES else 'en'
     try:
         primary = ctypes.windll.kernel32.GetUserDefaultUILanguage() & 0x3ff
     except (AttributeError, OSError):
@@ -158,9 +178,9 @@ def windows_language():
 # Settings, passed to sotc.py as environment variables.
 
 APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), 'sys_modules': '',
-                'user_dir': '', 'af16': True, 'textures': 'high', 'window_icon_file': '', 'fps60': False, 'fps_mode': '30', 'button_icons': 'ps', 'fullscreen': False,
+                'user_dir': '', 'af16': True, 'textures': 'high', 'hdr': False, 'window_icon_file': '', 'fps60': False, 'fps_mode': '30', 'button_icons': 'ps', 'fullscreen': False,
                 'present_mode': 'Mailbox', 'language': '', 'player_name': '', 'show_fps': False,
-                'readbacks': '', 'extra_env': '', 'debug_menu': False, 'debug_watch': False, 'rb_hot': False, 'skip_logos': False, 'skip_film': False, 'close_on_play': False, 'gamepad': '', 'rumble': True,
+                'readbacks': '', 'extra_env': '', 'debug_menu': False, 'debug_watch': False, 'rb_hot': True, 'skip_logos': False, 'skip_film': False, 'close_on_play': False, 'gamepad': '', 'rumble': True,
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
                 'fx_fog': True, 'fx_ssao': True, 'engine_cvars': '', 'perf_culling': True,
@@ -259,7 +279,7 @@ def sdl_key_name(keysym):
 def write_key_bindings(keys):
     """The launcher's key bindings as key.<input>= lines of sotc.ini (BB_CONFIG), replacing its
     earlier ones; other lines stay."""
-    ini = PORT_DIR / 'sotc.ini'
+    ini = DATA_DIR / 'sotc.ini'
     try:
         lines = ini.read_text(encoding='utf-8').splitlines()
     except OSError:
@@ -409,7 +429,7 @@ def user_dir(s):
     """The data folder (saves in savedata/1/<title id> below it: CUSA08809 EU, CUSA08034 US). A
     folder picked one level too deep (savedata itself, or a save folder) is taken back up to the
     data folder."""
-    folder = Path(s.get('user_dir') or PORT_DIR / 'user')
+    folder = Path(s.get('user_dir') or DATA_DIR / 'user')
     parts = [p.lower() for p in folder.parts]
     if 'savedata' in parts:
         folder = Path(*folder.parts[:len(parts) - 1 - parts[::-1].index('savedata')])
@@ -471,7 +491,7 @@ def start_event_log(log_dir, settings, env):
     lines = [
         _('Shadow of the Colossus PC {} - sessão de {}', 'Shadow of the Colossus PC {} - session of {}').format(
             VERSION, time.strftime('%Y-%m-%d %H:%M:%S')),
-        _('Windows {} | jogo: {}', 'Windows {} | game: {}').format(platform.version(), settings.get('game_dir') or '?'),
+        _('{} | jogo: {}', '{} | game: {}').format(system_name(), settings.get('game_dir') or '?'),
         _('Saída: {} | Upscaler: {} | Nitidez: {}', 'Output: {} | Upscaler: {} | Sharpening: {}').format(
             words(OUTPUTS, 'output_res', '1920x1080'), words(UPSCALERS, 'upscaler', 'fsr1'), words(SHARPNESS, 'sharpness', '250')),
         _('FPS: {} | Texturas: {} | Filtro 16x: {} | Modo PS4 Pro: {}', 'FPS: {} | Textures: {} | 16x filtering: {} | PS4 Pro mode: {}').format(
@@ -497,6 +517,13 @@ def start_event_log(log_dir, settings, env):
     return str(path)
 
 
+def system_name():
+    """'Windows 10.0.26100' or, elsewhere, the kernel's name and release ('Linux 7.2.9')."""
+    if IS_WINDOWS:
+        return f'Windows {platform.version()}'
+    return f'{platform.system()} {platform.release()}'
+
+
 def end_event_log(log_dir, code, stopped=False):
     """The end of the session in user/events.log; after a crash its copy goes to user/crashes."""
     path = log_dir / 'events.log'
@@ -516,6 +543,18 @@ def end_event_log(log_dir, code, stopped=False):
             shutil.copy2(path, crashes / (time.strftime('%Y-%m-%d_%H-%M-%S') + f'_{code & 0xffffffff:#x}_events.log'))
     except OSError:
         pass
+
+
+def open_external(target):
+    """Opens a folder or a web page with the system's own program."""
+    if IS_WINDOWS:
+        os.startfile(target)
+    else:
+        try:
+            subprocess.Popen(['xdg-open', target], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError:  # no xdg-utils: nothing to open it with
+            pass
 
 
 def short_path(path):
@@ -549,6 +588,44 @@ def _shortcut_script(play, frozen, executable, port_dir, game_icon):
             + (f'$s.Arguments={_ps_quote(arguments)};' if arguments else '') + '$s.Save()')
 
 
+INI_PATHS = (('SOTC_GAME_DIR', 'game_dir'), ('SOTC_SYS_MODULES', 'sys_modules'), ('SOTC_DLC_DIR', 'dlc_dir'),
+             ('SOTC_USER_DIR', 'user_dir'))
+INI_SWITCHES = (('BB_FULLSCREEN', 'fullscreen'), ('SOTC_NEO', 'neo'))
+
+
+def ini_settings():
+    """The launcher settings a sotc.ini of the data folder already chooses (written by hand, or by
+    the AppImage's start without a display), for a first start without saved settings. The game
+    ran with these, so they show as they were: textures stay off unless SOTC_LOD_LINGER=1."""
+    try:
+        lines = (DATA_DIR / 'sotc.ini').read_text(encoding='utf-8').splitlines()
+    except OSError:
+        return {}
+    ini = {}
+    for line in lines:
+        name, sep, value = line.partition('=')
+        if sep and not line.lstrip().startswith('#'):
+            ini[name.strip()] = value.strip()
+    # Only key bindings (which the launcher itself writes there): nothing chosen by hand.
+    if not any(name in ini for name, _key in (*INI_PATHS, *INI_SWITCHES)) and 'SOTC_MODES' not in ini \
+            and 'SOTC_FPS_CAP' not in ini:
+        return {}
+    settings = {key: ini[name] for name, key in INI_PATHS if ini.get(name)}
+    settings.update({key: ini[name] == '1' for name, key in INI_SWITCHES if name in ini})
+    if 'SOTC_MODES' in ini:
+        settings['af16'] = 'af16' in ini['SOTC_MODES'].split(',')
+    if ini.get('SOTC_FPS_CAP') == 'off':
+        settings['fps_mode'] = '60' if ini.get('SOTC_FPS_LIMIT') == '60' else 'unlimited'
+    elif 'SOTC_FPS_CAP' in ini:
+        settings['fps_mode'] = '30'
+    else:  # no frame rate line: sotc.py's 30 FPS cap, the launcher's default too
+        pass
+    settings['textures'] = 'high' if ini.get('SOTC_LOD_LINGER') == '1' else 'off'
+    if game_info(settings.get('game_dir')):
+        settings['setup_done'] = True
+    return settings
+
+
 def load_settings():
     """Saved settings over the defaults. Older settings that turned DLSS-G on with SOTC_DLSSG=1 in
     the extra variables get the frame generation setting instead."""
@@ -568,6 +645,8 @@ def load_settings():
                         shutil.copytree(source, target)
                     except OSError:
                         pass
+    if not saved:
+        saved = ini_settings()
     settings = {**APP_DEFAULTS, **saved}
     if 'fps_mode' not in saved:  # before the choice: the "uncapped FPS" box
         settings['fps_mode'] = '60' if saved.get('fps60') else '30'
@@ -636,6 +715,8 @@ def game_environment(s):
     # At this resolution the grass overflows the game's grass buffers: the farthest grass then pops
     # in and out in patches, in a band ahead with longer grass distances. grassbuf makes them 4x larger.
     modes.append('grassbuf')
+    if s.get('hdr'):
+        modes.append('hdr')
     env['SOTC_MODES'] = ','.join(modes)
     env['SOTC_FPS_CAP'] = '30' if fps_mode == '30' else 'off'
     env['SOTC_FPS_LIMIT'] = '60' if fps_mode == '60' else '0'
@@ -671,6 +752,8 @@ def game_environment(s):
         # no intro film and no title screen, the game goes straight in (user, 26 Oct).
         cvars.append('nointro')
     cvars += str(s.get('engine_cvars', '')).split()
+    # Tools (tools/sotc_route.py --boss) add cvars for one run without editing the settings.
+    cvars += os.environ.get('SOTC_EXTRA_CVARS', '').split()
     env['SOTC_CVARS'] = ' '.join(cvars)
     # Multipliers for the grass shaders' view distances and blade height (vk_rasterizer.cpp).
     env['SOTC_GRASS'] = ' '.join(str(s.get(k) or '1') for k in
@@ -739,10 +822,9 @@ def game_environment(s):
     env['SOTC_MOUSE'] = '1' if s.get('mouse', True) else '0'
     env['SOTC_MOUSE_SENS'] = str(s.get('mouse_sens') or '1.0')
     env['SOTC_MOUSE_INVERT'] = '1' if s.get('mouse_invert') else '0'
-    # Hot readbacks (buffer_cache.cpp GatherDownloads): ~25% more FPS at the Shrine; off by
-    # default since they put rainbow garbage and crashes on reused memory before the late check.
-    if s.get('rb_hot'):
-        env['SOTC_RB_HOT'] = '1'
+    # Hot readbacks (buffer_cache.cpp GatherDownloads): ~25% more FPS at the Shrine. On by default
+    # in this fork: the late check and per-page region locks keep them off reused memory.
+    env['SOTC_RB_HOT'] = '1' if s.get('rb_hot', True) else '0'
     # Bluepoint's debug menu (+RetailBuild=0 served by the port; the game files are not touched).
     if s.get('debug_menu'):
         env['SOTC_DEBUG_MENU'] = '1'
@@ -753,7 +835,7 @@ def game_environment(s):
         env['BB_GAMEPAD'] = str(s['gamepad']).strip()
     if not s.get('rumble', True):
         env['SOTC_RUMBLE'] = '0'
-    env['BB_CONFIG'] = str(PORT_DIR / 'sotc.ini')
+    env['BB_CONFIG'] = str(DATA_DIR / 'sotc.ini')
     for item in str(s['extra_env']).split():
         if '=' in item:
             key, value = item.split('=', 1)
@@ -790,7 +872,10 @@ def is_wide(size):
 def shadps4_saves(serial):
     """Save folders of the game serial in shadPS4 installations next to the port or in the usual
     places."""
-    roots = [PORT_DIR.parent, Path.home(), Path(os.environ.get('APPDATA', Path.home()))]
+    roots = [PORT_DIR.parent, Path.home(), Path(os.environ.get('APPDATA', Path.home())),
+             # Linux: shadPS4's data folder, and the one of its Flatpak.
+             Path(os.environ.get('XDG_DATA_HOME') or Path.home() / '.local' / 'share'),
+             Path.home() / '.var' / 'app' / 'net.shadps4.shadPS4' / 'data']
     found = []
     for root in roots:
         for pattern in ('*/user/home/*/savedata/' + serial, '*/*/user/home/*/savedata/' + serial,
@@ -805,6 +890,8 @@ def shadps4_saves(serial):
 # ---------------------------------------------------------------------------------------------
 # The window.
 
+WHEEL_DELTA_PER_NOTCH = 120  # Windows' <MouseWheel> delta for one notch of the wheel
+WINDOW_WIDTH, WINDOW_HEIGHT = 1080, 700  # the window's starting size at 96 DPI
 BG, PANEL, CARD, LINE = '#0d0f10', '#14171a', '#1b1f23', '#2a3036'
 TEXT, MUTED, GOLD, ACCENT, ACCENT_HI = '#e6e2da', '#8f9499', '#d7c08a', '#3e5f73', '#4f7790'
 
@@ -824,12 +911,16 @@ class Launcher:
         root.title('Shadow of the Colossus — ' + _('port nativo', 'native port'))
         root.configure(bg=BG)
         self.dpi = root.winfo_fpixels('1i') / 96.0
-        root.geometry(f'{self.px(1080)}x{self.px(700)}')
+        root.geometry(f'{self.px(WINDOW_WIDTH)}x{self.px(WINDOW_HEIGHT)}')
         root.minsize(self.px(940), self.px(620))
         self.set_icon()
         self.style()
         self.build()
         self.show('play')
+        # Fonts taller than Segoe UI (Linux's, some languages') need more than the default height.
+        root.update_idletasks()
+        height = min(max(self.px(WINDOW_HEIGHT), root.winfo_reqheight()), root.winfo_screenheight())
+        root.geometry(f'{self.px(WINDOW_WIDTH)}x{height}')
         self.refresh_library()
         # First start, or the game folder is gone: the setup screen asks for it.
         if not self.app.get('setup_done') or not game_info(self.var('game_dir').get()):
@@ -863,6 +954,15 @@ class Launcher:
             return
         except (ImportError, OSError):
             pass
+        if not IS_WINDOWS:  # X11 takes no .ico; Tk reads the PNGs itself
+            for picture in (Path(game) / 'sce_sys' / 'icon0.png', PORT_DIR / 'launcher' / 'sotc.png'):
+                try:
+                    self.icon = self.tk.PhotoImage(file=str(picture))
+                    self.root.iconphoto(True, self.icon)
+                    return
+                except self.tk.TclError:  # missing or unreadable: the next picture
+                    continue
+            return
         try:
             self.root.iconbitmap(default=str(PORT_DIR / 'launcher' / 'sotc.ico'))
         except self.tk.TclError:
@@ -1060,7 +1160,11 @@ class Launcher:
         side.pack_propagate(False)
         tk.Label(side, text='SHADOW OF\nTHE COLOSSUS', bg=BG, fg=GOLD, font=(title_font(), 15), justify='left').pack(
             anchor='w', padx=22, pady=(24, 0))
-        tk.Label(side, text=_('port nativo · Windows', 'native port · Windows') + f'  ·  v{VERSION}', bg=BG, fg=MUTED,
+        if IS_WINDOWS:
+            system = _('port nativo · Windows', 'native port · Windows')
+        else:
+            system = _('port nativo · Linux', 'native port · Linux')
+        tk.Label(side, text=system + f'  ·  v{VERSION}', bg=BG, fg=MUTED,
                  font=(ui_font(), 9)).pack(anchor='w', padx=22, pady=(2, 20))
         self.nav, self.current_page = {}, None
         for name, title in (('play', _('Jogar', 'Play')), ('game', _('Jogo e saves', 'Game & saves')),
@@ -1074,9 +1178,12 @@ class Launcher:
             item.bind('<Leave>', lambda _e, n=name: n != self.current_page and self.nav[n].configure(bg=BG))
             self.nav[name] = item
         tk.Frame(side, bg=BG).pack(fill='both', expand=True)
-        for text, command in ((_('Registro do jogo', 'Game log'), lambda: self.show('log')),
-                              (_('Procurar atualização', 'Check for updates'), lambda: self.check_updates(True)),
-                              (_('Configurar de novo', 'Set up again'), self.show_setup)):
+        links = [(_('Registro do jogo', 'Game log'), lambda: self.show('log'))]
+        # sotc_update.py installs the Windows release: the Linux AppImage is not updated by it.
+        if IS_WINDOWS:
+            links.append((_('Procurar atualização', 'Check for updates'), lambda: self.check_updates(True)))
+        links.append((_('Configurar de novo', 'Set up again'), self.show_setup))
+        for text, command in links:
             link = tk.Label(side, text=text, bg=BG, fg=MUTED, font=(ui_font(), 9, 'underline'), cursor='hand2')
             link.pack(anchor='w', padx=22, pady=(0, 6))
             link.bind('<Button-1>', lambda _e, c=command: c())
@@ -1087,12 +1194,13 @@ class Launcher:
         bar = tk.Frame(right, bg=BG, height=self.px(72))
         bar.pack(fill='x', side='bottom')
         bar.pack_propagate(False)
-        self.status = tk.Label(bar, text='', bg=BG, fg=MUTED, font=(ui_font(), 10), anchor='w', justify='left')
-        self.status.pack(side='left', padx=24)
+        # The buttons are packed first: a status line too long for the bar is cut, not them.
         self.play_button = ttk.Button(bar, text=_('JOGAR', 'PLAY'), style='Play.TButton', command=self.play)
         self.play_button.pack(side='right', padx=(10, 24), pady=11)
         self.stop_button = ttk.Button(bar, text=_('Parar', 'Stop'), command=self.stop, state='disabled')
         self.stop_button.pack(side='right', pady=11)
+        self.status = tk.Label(bar, text='', bg=BG, fg=MUTED, font=(ui_font(), 10), anchor='w', justify='left')
+        self.status.pack(side='left', padx=24)
         self.content = tk.Frame(right, bg=PANEL)
         self.content.pack(fill='both', expand=True)
 
@@ -1104,14 +1212,17 @@ class Launcher:
         self.build_advanced()
         self.build_debug()
         self.build_log()
-        self.root.bind_all('<MouseWheel>', self.wheel)
+        self.root.bind_all('<MouseWheel>', lambda e: self.wheel(e, int(-e.delta / WHEEL_DELTA_PER_NOTCH)))
+        # Tk on X11 reports the wheel as buttons 4 (up) and 5 (down).
+        self.root.bind_all('<Button-4>', lambda e: self.wheel(e, -1))
+        self.root.bind_all('<Button-5>', lambda e: self.wheel(e, 1))
         self.refresh_status()
 
-    def wheel(self, event):
+    def wheel(self, event, units):
         page = self.pages.get(self.current_page)
         if hasattr(page, 'scroll') and not isinstance(event.widget, (self.tk.Text, self.ttk.Combobox)) \
                 and 'popdown' not in str(event.widget):
-            page.scroll(int(-event.delta / 120))
+            page.scroll(units)
 
     def show(self, name):
         for page in self.pages.values():
@@ -1152,11 +1263,12 @@ class Launcher:
         self.row(quick, _('FPS', 'FPS'), self.choice(quick, 'fps_mode', FPS_MODES, 24))
         self.row(quick, _('Texturas', 'Textures'), self.choice(quick, 'textures', TEXTURES, 24))
         self.check(quick, 'af16', _('Texturas nítidas (filtro 16x)', 'Sharp textures (16x filtering)'))
+        self.check(quick, 'hdr', _('HDR (HDR do Windows ligado)', 'HDR (Windows HDR on)'))
         self.check(quick, 'fullscreen', _('Tela cheia', 'Fullscreen'))
         self.check(quick, 'neo', _('Modo PS4 Pro', 'PS4 Pro mode'))
         self.check(quick, 'rb_hot', _('Mais FPS: leituras rápidas da GPU (experimental)',
                                       'More FPS: fast GPU readbacks (experimental)'))
-        for key in ('af16', 'textures', 'fps_mode', 'fullscreen', 'neo', 'output_res', 'upscaler', 'sharpness', 'framegen'):
+        for key in ('af16', 'textures', 'fps_mode', 'hdr', 'fullscreen', 'neo', 'output_res', 'upscaler', 'sharpness', 'framegen'):
             self.vars[key].trace_add('write', lambda *_a: self.refresh_status())
 
     def draw_banner(self):
@@ -1280,6 +1392,9 @@ class Launcher:
         self.row(f, _('Idioma do sistema', 'System language'), self.choice(f, 'language', LANGUAGES),
                  _('O idioma que o jogo vê no "console".', 'The language the game sees on the "console".'))
         self.row(f, _('Nome do jogador', 'Player name'), ttk.Entry(f, textvariable=self.var('player_name'), width=30))
+        self.check(f, 'skip_logos', _('Pular os logotipos de abertura', 'Skip the opening logos'),
+                   _('O jogo abre direto no menu, sem os logotipos de abertura e o aviso de salvamento automático.',
+                     'The game opens straight to the menu, without the opening logos and the autosave notice.'))
 
     def build_graphics(self):
         f = self.scrolled_page('graphics', _('Imagem e FPS', 'Display & FPS'),
@@ -1311,7 +1426,16 @@ class Launcher:
                    'the GPU has it, else FSR 3. Experimental: it only matters with the 60 FPS mode off, and the '
                    'health and stamina bars may shake (the generated frame includes the interface). '
                    'In game, F8 switches the mode (off, DLSS-G, FSR 3). Best with the '
-                   'screen at 60 or 120 Hz, or G-SYNC/FreeSync.'))
+                   'screen at 60 or 120 Hz, or G-SYNC/FreeSync.') + ' ' +
+                 _('FSR 3 é experimental: numa RTX 3060 a taxa real do jogo caiu (24-30 FPS em vez de 40-50), '
+                   'com mais travadas e falhas na imagem. DLSS-G só funciona nas RTX 40/50: nas outras placas '
+                   'ela fica desligada e o F8 passa para FSR 3.',
+                   "FSR 3 is experimental: on an RTX 3060 the game's real frame rate dropped (24-30 FPS instead of "
+                   '40-50), with more stutter and image glitches. DLSS-G only works on RTX 40/50: on other cards '
+                   'it stays off and F8 switches to FSR 3.'))
+        self.check(f, 'hdr', _('HDR', 'HDR'),
+                   _('Saída HDR10 e a renderização HDR do jogo. Ligue o HDR do Windows antes de jogar.',
+                     'HDR10 output and the game\'s HDR rendering. Turn on Windows HDR before playing.'))
         self.check(f, 'fg_hudless', _('Geração de quadros sem a interface (experimental)',
                                       'Frame generation without the interface (experimental)'),
                    _('Gera os quadros intermediários só com a cena e põe a interface por cima, sem interpolá-la: '
@@ -1320,7 +1444,8 @@ class Launcher:
                      'Generates the in-between frames from the scene only and draws the interface on top, '
                      'uninterpolated: removes the shaking health/stamina bars and text. It can fade the '
                      'logo on the title screen and show the old scene behind loading screens.'))
-        self.window_icon_row(f)
+        if IS_WINDOWS:  # Pillow makes the icon (window_icon_file); the AppImage's Python has none
+            self.window_icon_row(f)
         self.section(f, _('Resolução', 'Resolution'))
         self.row(f, _('Saída', 'Output'), self.choice(f, 'output_res', OUTPUTS),
                  _('O jogo renderiza nesse tamanho. '
@@ -1372,11 +1497,11 @@ class Launcher:
                                      'Full water reflections (direct memory access)'),
                    _('Deixa os shaders lerem tabelas da memória do jogo direto (como o Pink-shadPS4): o lago ondula '
                      'e reflete até longe. Desligado ganha ~10% de FPS, mas a água longe fica mais lisa. '
-                     'Ao trocar, os shaders são compilados de novo na primeira vez. Em placas AMD fica '
+                     'Ao trocar, os shaders são compilados de novo na primeira vez. Em placas AMD e Intel fica '
                      'desligado (desenhava listras nas sombras e na água).',
                      'Lets shaders read tables straight from game memory (as Pink-shadPS4 does): the lake ripples '
                      'and reflects far away. Off gains ~10% FPS, but distant water is flatter. After a change '
-                     'the shaders are compiled again the first time. Off on AMD cards (it drew stripes over '
+                     'the shaders are compiled again the first time. Off on AMD and Intel cards (it drew stripes over '
                      'shadows and water).'))
         self.row(f, _('Envio de trabalho à GPU', 'GPU work submission'), self.choice(f, 'gpu_submit', GPU_SUBMIT),
                  _('Manda trabalho à GPU a cada 0,5 ms e lê resultados por um atalho (técnicas do Pink-shadPS4). '
@@ -1588,15 +1713,18 @@ class Launcher:
         self.row(f, _('Idioma do lançador', 'Launcher language'), self.choice(f, 'ui_language', UI_LANGUAGES),
                  _('Vale na próxima vez que o lançador abrir.', 'Applies when the launcher opens again.'))
         self.check(f, 'close_on_play', _('Fechar o lançador quando o jogo abrir', 'Close the launcher when the game starts'))
-        self.check(f, 'check_updates', _('Procurar atualizações ao abrir', 'Check for updates at startup'),
-                   _('Pergunta antes de baixar. Saves, cache de shaders e sotc.ini são mantidos.',
-                     'Asks before downloading. Saves, shader cache and sotc.ini are kept.'))
+        # Updates and the shortcut are Windows ones (the release zip, a .lnk); the AppImage has neither.
+        if IS_WINDOWS:
+            self.check(f, 'check_updates', _('Procurar atualizações ao abrir', 'Check for updates at startup'),
+                       _('Pergunta antes de baixar. Saves, cache de shaders e sotc.ini são mantidos.',
+                         'Asks before downloading. Saves, shader cache and sotc.ini are kept.'))
         holder = ttk.Frame(f)
         holder.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(10, 0))
-        ttk.Button(holder, text=_('Atalho na área de trabalho', 'Desktop shortcut'), command=self.shortcut).pack(side='left')
-        ttk.Button(holder, text=_('Atalho para jogar direto', 'Shortcut that starts the game'),
-                   command=lambda: self.shortcut(play=True)).pack(side='left', padx=(6, 0))
-        ttk.Button(holder, text=_('Pasta do port', 'Port folder'), command=lambda: self.open_path(PORT_DIR)).pack(side='left', padx=6)
+        if IS_WINDOWS:
+            ttk.Button(holder, text=_('Atalho na área de trabalho', 'Desktop shortcut'), command=self.shortcut).pack(side='left', padx=(0, 6))
+            ttk.Button(holder, text=_('Atalho para jogar direto', 'Shortcut that starts the game'),
+                       command=lambda: self.shortcut(play=True)).pack(side='left', padx=(6, 0))
+        ttk.Button(holder, text=_('Pasta do port', 'Port folder'), command=lambda: self.open_path(DATA_DIR)).pack(side='left', padx=(0, 6))
         ttk.Button(holder, text=_('Limpar cache de shaders', 'Clear shader cache'), command=self.clear_cache).pack(side='left')
         self.section(f, _('Diagnóstico', 'Diagnostics'))
         self.check(f, 'show_fps', _('FPS no registro (a cada 5 s)', 'FPS in the log (every 5 s)'))
@@ -1684,6 +1812,8 @@ class Launcher:
                           'fsr': 'FSR 3'}.get(framegen, framegen))
         if self.var('af16').get():
             parts.append(_('AF 16x', '16x AF'))
+        if self.var('hdr').get():
+            parts.append('HDR')
         if self.var('neo').get():
             parts.append('PS4 Pro' if not is_wide(self.var('output_res').get())
                          else _('PS4 Pro desligado (tela larga)', 'PS4 Pro off (wide screen)'))
@@ -1691,11 +1821,12 @@ class Launcher:
         return '   ·   '.join(parts)
 
     def detect_gpu(self):
-        exe = PORT_DIR / 'bin' / 'bb-gpu-capabilities.exe'
+        name = 'bb-gpu-capabilities.exe' if IS_WINDOWS else 'bb-gpu-capabilities'
+        exe = PORT_DIR / 'bin' / name
         if not exe.is_file():
-            exe = PORT_DIR / 'out' / 'bb-gpu-capabilities.exe'
+            exe = PORT_DIR / 'out' / name
         env = dict(os.environ)
-        if not (exe.parent / 'SDL3.dll').is_file():
+        if IS_WINDOWS and not (exe.parent / 'SDL3.dll').is_file():
             clang64 = Path(os.environ.get('MSYS2_ROOT', r'C:\msys64')) / 'clang64' / 'bin'
             env['PATH'] = f'{clang64}{os.pathsep}{env.get("PATH", "")}'
         text = _('• Placa de vídeo: não verificada', '• Graphics card: not checked')
@@ -2129,6 +2260,11 @@ class Launcher:
                                                                   'Choose the game folder with eboot.bin (CUSA08809 or CUSA08034).'))
             self.show('game')
             return
+        free = free_commit_gb()
+        if free is not None and free < MIN_FREE_COMMIT_GB and not self.messagebox.askyesno(
+                'Shadow of the Colossus', _('O Windows só tem {:.1f} GB livres para programas (RAM + arquivo de paginação). O jogo reserva cerca de 6 GB ao abrir e precisa de mais alguns GB depois; com menos, ele fecha logo no início (erro 1455 no log).\n\nPara resolver: Iniciar → "Ajustar a aparência e o desempenho do Windows" → Avançado → Memória virtual → Alterar… → marque "Gerenciar automaticamente o tamanho do arquivo de paginação" (ou defina pelo menos 16 GB) e reinicie o PC. Fechar navegadores e outros programas grandes também ajuda.\n\nAbrir o jogo mesmo assim?',
+                                            'Windows has only {:.1f} GB free for programs (RAM + page file). The game reserves about 6 GB when it starts and needs a few GB more after that; with less it closes right at the start (error 1455 in the log).\n\nTo fix it: Start → "Adjust the appearance and performance of Windows" → Advanced → Virtual memory → Change… → tick "Automatically manage paging file size for all drives" (or set at least 16 GB) and restart the PC. Closing browsers and other big programs also helps.\n\nStart the game anyway?').format(free)):
+            return
         self.set_log('')
         try:
             write_key_bindings(self.app.get('keys'))
@@ -2140,7 +2276,7 @@ class Launcher:
             env['SOTC_EVENT_LOG'] = start_event_log(user_dir(self.app), self.app, env)
             self.process = subprocess.Popen(run_command(), cwd=PORT_DIR, env=env,
                                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                            stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
+                                            stderr=subprocess.STDOUT, **GAME_PROCESS_FLAGS)
         except OSError as error:
             self.append(_('Não foi possível iniciar: {}', 'Could not start: {}').format(error) + '\n')
             self.process = None
@@ -2242,10 +2378,10 @@ class Launcher:
         self.root.clipboard_append(self.log.get('1.0', 'end'))
 
     def open_path(self, path):
-        path = Path(path or PORT_DIR)
+        path = Path(path or DATA_DIR)
         if not path.exists():
             path.mkdir(parents=True, exist_ok=True)
-        os.startfile(str(path))
+        open_external(str(path))
 
     def clear_cache(self):
         if self.process:
@@ -2315,7 +2451,7 @@ class Launcher:
             new=release['version'], cur=VERSION, notes=notes)
         if not FROZEN:  # running from the sources: nothing to replace, show the release
             if self.messagebox.askyesno('Shadow of the Colossus', question + _('Abrir a página?', 'Open the page?')):
-                os.startfile(release['page'])
+                open_external(release['page'])
             return
         if self.messagebox.askyesno('Shadow of the Colossus', question + _(
                 'Baixar e instalar agora? Saves, cache de shaders e sotc.ini são mantidos, e o lançador abre '
@@ -2375,9 +2511,15 @@ class Launcher:
 
 
 class GameJob:
-    """A Windows job holding sotc.py and the bb-probe.exe it starts (Stop ends both)."""
+    """A Windows job holding sotc.py and the bb-probe.exe it starts (Stop ends both). On Linux the
+    process group they share (GAME_PROCESS_FLAGS starts sotc.py as its leader)."""
 
     def __init__(self, process):
+        self.group = None
+        self.handle = None
+        if not IS_WINDOWS:
+            self.group = process.pid
+            return
         kernel32 = ctypes.windll.kernel32
         kernel32.CreateJobObjectW.restype = ctypes.c_void_p
         self.handle = kernel32.CreateJobObjectW(None, None)
@@ -2385,13 +2527,44 @@ class GameJob:
             kernel32.AssignProcessToJobObject(ctypes.c_void_p(self.handle), ctypes.c_void_p(int(process._handle)))
 
     def terminate(self):
-        if self.handle:
+        if self.group:
+            try:
+                os.killpg(self.group, signal.SIGKILL)  # as TerminateJobObject: no chance to linger
+            except ProcessLookupError:  # the game already ended
+                pass
+        elif self.handle:
             ctypes.windll.kernel32.TerminateJobObject(ctypes.c_void_p(self.handle), 1)
+        else:  # no job could be created: nothing holds the game
+            pass
 
     def close(self):
+        self.group = None
         if self.handle:
             ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(self.handle))
             self.handle = None
+
+
+def free_commit_gb():
+    """Commit memory Windows can still give programs (RAM + page file), in GB; None if unknown."""
+    class MemoryStatus(ctypes.Structure):
+        _fields_ = [('length', ctypes.c_uint32), ('load', ctypes.c_uint32),
+                    ('total_phys', ctypes.c_uint64), ('avail_phys', ctypes.c_uint64),
+                    ('total_commit', ctypes.c_uint64), ('avail_commit', ctypes.c_uint64),
+                    ('total_virtual', ctypes.c_uint64), ('avail_virtual', ctypes.c_uint64),
+                    ('avail_extended', ctypes.c_uint64)]
+    status = MemoryStatus()
+    status.length = ctypes.sizeof(status)
+    try:
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return None
+    except (AttributeError, OSError):
+        return None
+    return status.avail_commit / 1e9
+
+
+# The guest memory pool (~6 GB, committed at once when the game starts) plus the process itself:
+# below this the game stops at boot with error 1455 (issue #95).
+MIN_FREE_COMMIT_GB = 8.0
 
 
 def play_without_window(settings):
@@ -2408,7 +2581,7 @@ def play_without_window(settings):
     with open_session_log(log_dir) as log:
         process = subprocess.Popen(run_command(), cwd=PORT_DIR, env=env,
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                   stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
+                                   stderr=subprocess.STDOUT, **GAME_PROCESS_FLAGS)
         for raw in iter(process.stdout.readline, b''):
             text = raw.decode('utf-8', errors='replace')
             log.write(text)
@@ -2455,10 +2628,11 @@ def main():
     LANG = settings.get('ui_language') or windows_language()
     if '--play' in args and (Path(settings['game_dir'] or '.') / 'eboot.bin').is_file():
         sys.exit(play_without_window(settings))
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)
-    except (AttributeError, OSError):
-        pass
+    if IS_WINDOWS:
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except (AttributeError, OSError):
+            pass
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
     root = tk.Tk()
