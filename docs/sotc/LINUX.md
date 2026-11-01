@@ -29,7 +29,7 @@ Without a display (terminal, SSH) or with `--setup`, only this file applies.
 
 | Opção / Option | Valor / Value |
 |---|---|
-| `SOTC_MODES` | `af16` (filtro 16x / 16x AF), `fps60` (experimental); ex. `af16,fps60`. Só / only EU 1.01 |
+| `SOTC_MODES` | `af16` (filtro 16x / 16x AF), `fps60` (experimental), `hdr` (HDR do jogo com saída HDR10; no Linux precisa de saída HDR do compositor / game HDR with HDR10 output; on Linux needs an HDR-enabled compositor output, e.g. Hyprland `cm_auto_hdr`); ex. `af16,fps60`. Só / only EU 1.01 |
 | `SOTC_NEO` | `1`: modo PS4 Pro / PS4 Pro mode |
 | `SOTC_OUTPUT_RES` | saída / output, ex. `2560x1440` (padrão / default `1920x1080`; o jogo renderiza em / renders at 1080p) |
 | `BB_FSR1` | `1`: FSR 1 para ampliar / to upscale (pelo `.ini` vem desligado / off by default here) |
