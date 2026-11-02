@@ -8,6 +8,7 @@
 #include <utility>
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_dlssg.h"
+#include "video_core/renderer_vulkan/vk_fsr3up.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/texture_cache/sampler.h"
 
@@ -16,7 +17,7 @@ namespace VideoCore {
 // sotc: with DLSS super resolution, textures are sampled as sharp as at the output size
 // (NVIDIA: mip bias log2(render height / output height)). SOTC_MIP_BIAS overrides. Without
 // SOTC_RENDER_RES the game renders at 1080p (sotc.py leaves it unset for 1920x1080).
-static float UpscalerMipBias() {
+static float DlssMipBias() {
     static const float bias = [] {
         if (const char* v = std::getenv("SOTC_MIP_BIAS"); v && *v) {
             return static_cast<float>(std::atof(v));
@@ -41,6 +42,7 @@ static float UpscalerMipBias() {
     }
     return bias;
 }
+
 
 Sampler::Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sampler,
                  const AmdGpu::BorderColorBuffer border_color_base, const bool is_depth) {
@@ -77,7 +79,6 @@ Sampler::Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sample
         }
     }();
 
-    const float upscaler_bias = is_depth ? 0.0f : UpscalerMipBias(); // sotc: DLSS
     const vk::SamplerCreateInfo sampler_ci = {
         .pNext = custom_color ? &*custom_color : nullptr,
         .magFilter = LiverpoolToVK::Filter(sampler.xy_mag_filter),
@@ -86,10 +87,13 @@ Sampler::Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sample
         .addressModeU = LiverpoolToVK::ClampMode(sampler.clamp_x),
         .addressModeV = LiverpoolToVK::ClampMode(sampler.clamp_y),
         .addressModeW = LiverpoolToVK::ClampMode(sampler.clamp_z),
-        .mipLodBias = upscaler_bias == 0.0f
-                          ? std::min(sampler.LodBias(), instance.MaxSamplerLodBias())
-                          : std::clamp(sampler.LodBias() + upscaler_bias,
-                                       -instance.MaxSamplerLodBias(), instance.MaxSamplerLodBias()),
+        // sotc: with an upscaler on, the textures are sampled finer to keep the detail of the
+        // output size (a compare sampler of a depth map is left alone): the temporal upscaler's
+        // bias when it runs, else the DLSS super resolution one.
+        .mipLodBias = std::clamp(sampler.LodBias() + (is_depth ? 0.0f
+                                                  : Vulkan::Fsr3Up::Wanted() ? Vulkan::Fsr3Up::MipBias()
+                                                                             : DlssMipBias()),
+                                 -instance.MaxSamplerLodBias(), instance.MaxSamplerLodBias()),
         .anisotropyEnable = anisotropy_enable,
         .maxAnisotropy = max_anisotropy,
         // GCN compares per instruction; a plain read of a compare sampler is undefined in Vulkan.

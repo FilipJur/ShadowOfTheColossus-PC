@@ -129,6 +129,7 @@ private:
     /// sotc: the same FSR 1 for the frame without the HUD (frame generation), with its own images:
     /// fsr_pass's ring holds the game frame's.
     HostPasses::FsrPass fsr_pass_hudless;
+    HostPasses::FsrPass sharpen_pass; ///< sotc: RCAS over the temporal upscaler output (present thread)
     HostPasses::FsrPass::Settings fsr_settings{};
     HostPasses::PostProcessingPass::Settings pp_settings{};
     HostPasses::PostProcessingPass pp_pass;

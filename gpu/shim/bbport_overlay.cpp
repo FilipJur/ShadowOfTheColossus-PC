@@ -25,6 +25,8 @@
 #include <unordered_map>
 #include "imgui_impl_vulkan.h"
 #include "video_core/renderer_vulkan/vk_framegen.h"
+#include "video_core/renderer_vulkan/vk_fsr3up.h"
+#include "video_core/renderer_vulkan/vk_upscaler.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/sotc_fps_cap.h"
@@ -571,12 +573,17 @@ void QuickSettings() {
     const int up_mode = (live_fsr1 >= 0 ? live_fsr1 : env_fsr1) ? 0 : 1;
     const char* up_names[] = {T("FSR 1 (AMD, qualquer placa)", "FSR 1 (AMD, any GPU)"),
                               T("Bilinear (simples)", "Bilinear (plain)")};
-    // sotc: DLSS (SOTC_UPSCALER=dlss) is chosen at start, its render size with it: shown, not
-    // switchable here (picking FSR 1 here saved "fsr1" over the launcher's DLSS, 26 Oct).
+    // sotc: the temporal upscaler (SOTC_UPSCALER=fsr3/ffxapi/fsr4) is chosen at start, its render
+    // size with it: shown, not switchable here (picking FSR 1 here saved "fsr1" over the
+    // launcher's choice, 26 Oct). The DLSS path (SOTC_UPSCALER=dlss) predates it and stays as is.
     static const bool dlss_start = [] {
         const char* v = std::getenv("SOTC_UPSCALER");
         return v && std::strcmp(v, "dlss") == 0;
     }();
+    const bool temporal_start = Vulkan::Fsr3Up::AskedAtStart();
+    const char* temporal_name = Vulkan::Upscaler::Active()
+                                    ? Vulkan::Upscaler::Active()->Name()
+                                    : "Temporal";
     if (dlss_start) {
         ImGui::BeginDisabled();
         if (ImGui::BeginCombo("Upscaler", "NVIDIA DLSS")) {
@@ -585,6 +592,14 @@ void QuickSettings() {
         ImGui::EndDisabled();
         Hint(T("DLSS troca no lançador (vale ao abrir o jogo de novo).",
                "DLSS is switched in the launcher (applies when the game starts again)."));
+    } else if (temporal_start) {
+        ImGui::BeginDisabled();
+        if (ImGui::BeginCombo("Upscaler", temporal_name)) {
+            ImGui::EndCombo();
+        }
+        ImGui::EndDisabled();
+        Hint(T("O upscaler temporal troca no lançador (vale ao abrir o jogo de novo).",
+               "The temporal upscaler is switched in the launcher (applies when the game starts again)."));
     } else if (ImGui::BeginCombo("Upscaler", up_names[up_mode])) {
         for (int i = 0; i < 2; ++i) {
             if (ImGui::Selectable(up_names[i], i == up_mode) && i != up_mode) {
@@ -1111,6 +1126,10 @@ float FpsCounter() {
                                SotcStats::kFrameCauseNames[cause],
                                SotcStats::ov_worst_cause_ms.load());
         }
+    }
+    // sotc: which temporal upscaler runs (built-in FSR 3.1, FFX API DLL, FSR 4), if any.
+    if (Vulkan::Fsr3Up::Wanted() && Vulkan::Upscaler::Active()) {
+        ImGui::TextColored(grey, "%s", Vulkan::Upscaler::Active()->Name());
     }
     // Frame generation (vk_framegen.h): DLSS-G (vk_dlssg.cpp) or FSR 3 (vk_fsrfg.cpp).
     switch (Vulkan::FrameGen::Current()) {

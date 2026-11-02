@@ -121,6 +121,10 @@ void FsrPass::Create(vk::Device device, VmaAllocator allocator, u32 num_images) 
     device.destroyShaderModule(cs_rcas_module);
 
     available_imgs.resize(num_images);
+    // sotc: the presenter keeps at most max(swapchain images, 4) frames in flight
+    // (vk_presenter.cpp, num_frames), so an image may still be read that many Render calls after
+    // its last use.
+    release_delay = (num_images < 4u ? 4u : num_images) + 1;
     for (int i = 0; i < num_images; ++i) {
         auto& img = available_imgs[i];
         img.id = i;
@@ -139,7 +143,7 @@ vk::ImageView FsrPass::Sharpen(vk::CommandBuffer cmdbuf, vk::ImageView input, vk
         cur_image = 0;
     }
     if (img.dirty) {
-        CreateImages(img);
+        CreateImages(img, false);
     }
 
     constexpr vk::ImageSubresourceRange simple_subresource = {
@@ -203,16 +207,18 @@ vk::ImageView FsrPass::Sharpen(vk::CommandBuffer cmdbuf, vk::ImageView input, vk
 vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
                               vk::Extent2D input_size, vk::Extent2D output_size, Settings settings,
                               bool hdr) {
-    if (!settings.enable) {
-        DebugState.is_using_fsr = false;
-        return input;
-    }
-    if (input_size.width >= output_size.width && input_size.height >= output_size.height) {
-        DebugState.is_using_fsr = false;
+    // sotc: same size in and out: RCAS sharpening alone (FSR 1 at its game size, and the FSR 3.1 /
+    // DLSS output); it was skipped with the scaling, so the sharpening setting did nothing there.
+    const bool rcas_only = settings.use_rcas && input_size == output_size;
+    if (!settings.enable || (!rcas_only && input_size.width >= output_size.width &&
+                             input_size.height >= output_size.height)) {
+        // sotc: FSR is off: its images (2 x RGBA16F per frame in the ring) are not needed, so
+        // release them instead of keeping them until the presenter is destroyed.
+        ReleaseImagesWhenIdle();
         return input;
     }
 
-    DebugState.is_using_fsr = true;
+    release_pending = false; // sotc: still in use, cancel a release in progress
 
     if (output_size != cur_size) {
         ResizeAndInvalidate(output_size.width, output_size.height);
@@ -224,8 +230,9 @@ vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
         cur_image = 0;
     }
 
-    if (img.dirty) {
-        CreateImages(img);
+    // sotc: RCAS alone needs no intermediary image (one RGBA16F at the output size per ring slot).
+    if (img.dirty || (!rcas_only && !img.intermediary_image)) {
+        CreateImages(img, !rcas_only);
     }
 
     if (EmulatorSettings.IsVkHostMarkersEnabled()) {
@@ -243,6 +250,9 @@ vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
         .levelCount = 1,
         .layerCount = 1,
     };
+    // sotc: the output image too, on both paths: without RCAS it was written in the layout the
+    // last frame left it in (shader read only), and its earlier readers (the post process pass)
+    // must be done before it is written again.
     const std::array enter_barrier{
         vk::ImageMemoryBarrier2{
             .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
@@ -254,10 +264,20 @@ vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
             .image = img.intermediary_image,
             .subresourceRange = simple_subresource,
         },
+        vk::ImageMemoryBarrier2{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eNone,
+            .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+            .oldLayout = vk::ImageLayout::eUndefined,
+            .newLayout = vk::ImageLayout::eGeneral,
+            .image = img.output_image,
+            .subresourceRange = simple_subresource,
+        },
     };
     cmdbuf.pipelineBarrier2({
-        .imageMemoryBarrierCount = enter_barrier.size(),
-        .pImageMemoryBarriers = enter_barrier.data(),
+        .imageMemoryBarrierCount = rcas_only ? 1u : static_cast<u32>(enter_barrier.size()),
+        .pImageMemoryBarriers = enter_barrier.data() + (rcas_only ? 1 : 0),
     });
 
     FSRConstants consts{};
@@ -269,8 +289,7 @@ vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
     consts.Sample[0] = 0; // sotc: not squared for HDR, see the rcas pass
 
     if (settings.use_rcas) {
-
-        { // easu
+        if (!rcas_only) { // easu
             std::array<vk::DescriptorImageInfo, 3> img_info{{
                 {
                     .imageView = input,
@@ -312,34 +331,24 @@ vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
             cmdbuf.pushConstants(pipeline_layout.get(), vk::ShaderStageFlagBits::eCompute, 0,
                                  sizeof(FSRConstants), &consts);
             cmdbuf.dispatch(dispatch_x, dispatch_y, 1);
-        }
 
-        std::array img_barrier{
-            vk::ImageMemoryBarrier2{
-                .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-                .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
-                .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-                .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
-                .oldLayout = vk::ImageLayout::eGeneral,
-                .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
-                .image = img.intermediary_image,
-                .subresourceRange = simple_subresource,
-            },
-            vk::ImageMemoryBarrier2{
-                .srcStageMask = vk::PipelineStageFlagBits2::eTopOfPipe,
-                .srcAccessMask = vk::AccessFlagBits2::eNone,
-                .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-                .dstAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
-                .oldLayout = vk::ImageLayout::eUndefined,
-                .newLayout = vk::ImageLayout::eGeneral,
-                .image = img.output_image,
-                .subresourceRange = simple_subresource,
-            },
-        };
-        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-            .imageMemoryBarrierCount = img_barrier.size(),
-            .pImageMemoryBarriers = img_barrier.data(),
-        });
+            std::array img_barrier{
+                vk::ImageMemoryBarrier2{
+                    .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                    .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+                    .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                    .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+                    .oldLayout = vk::ImageLayout::eGeneral,
+                    .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                    .image = img.intermediary_image,
+                    .subresourceRange = simple_subresource,
+                },
+            };
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                .imageMemoryBarrierCount = img_barrier.size(),
+                .pImageMemoryBarriers = img_barrier.data(),
+            });
+        }
 
         { // rcas
             consts = {};
@@ -350,7 +359,7 @@ vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
 
             std::array<vk::DescriptorImageInfo, 3> img_info{{
                 {
-                    .imageView = img.intermediary_image_view.get(),
+                    .imageView = rcas_only ? input : img.intermediary_image_view.get(),
                     .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
                 },
                 {
@@ -470,7 +479,48 @@ void FsrPass::ResizeAndInvalidate(u32 width, u32 height) {
     }
 }
 
-void FsrPass::CreateImages(Img& img) const {
+void FsrPass::ReleaseImagesWhenIdle() {
+    if (!ImagesAlive()) {
+        release_pending = false;
+        return;
+    }
+    // sotc: the frames recorded with these images may still be on the GPU (see release_delay):
+    // wait before freeing them. Until then they idle, which they did before anyway.
+    if (!release_pending) {
+        release_pending = true;
+        release_wait = release_delay;
+        return;
+    }
+    if (release_wait > 1) {
+        --release_wait;
+        return;
+    }
+    ReleaseImages();
+    release_pending = false;
+}
+
+void FsrPass::ReleaseImages() {
+    for (auto& img : available_imgs) {
+        // Views first: a view references its image.
+        img.intermediary_image_view.reset();
+        img.output_image_view.reset();
+        img.intermediary_image.Destroy();
+        img.output_image.Destroy();
+        img.dirty = true; // sotc: CreateImages recreates them when FSR is enabled again
+    }
+    cur_image = 0;
+}
+
+bool FsrPass::ImagesAlive() const {
+    for (const auto& img : available_imgs) {
+        if (img.intermediary_image || img.output_image) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void FsrPass::CreateImages(Img& img, bool with_intermediary) const {
     img.dirty = false;
 
     // Destroy previous resources before re-creating at new size.
@@ -495,9 +545,11 @@ void FsrPass::CreateImages(Img& img) const {
         .usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eStorage,
         .initialLayout = vk::ImageLayout::eUndefined,
     };
-    img.intermediary_image.Create(image_create_info);
-    SetObjectName(device, static_cast<vk::Image>(img.intermediary_image),
-                  "FSR Intermediary Image #{}", img.id);
+    if (with_intermediary) {
+        img.intermediary_image.Create(image_create_info);
+        SetObjectName(device, static_cast<vk::Image>(img.intermediary_image),
+                      "FSR Intermediary Image #{}", img.id);
+    }
     image_create_info.usage = vk::ImageUsageFlagBits::eTransferSrc |
                               vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eStorage |
                               vk::ImageUsageFlagBits::eColorAttachment;
@@ -514,10 +566,12 @@ void FsrPass::CreateImages(Img& img) const {
             .layerCount = 1,
         },
     };
-    img.intermediary_image_view = Check<"create fsr intermediary image view">(
-        device.createImageViewUnique(image_view_create_info));
-    SetObjectName(device, img.intermediary_image_view.get(), "FSR Intermediary ImageView #{}",
-                  img.id);
+    if (with_intermediary) {
+        img.intermediary_image_view = Check<"create fsr intermediary image view">(
+            device.createImageViewUnique(image_view_create_info));
+        SetObjectName(device, img.intermediary_image_view.get(), "FSR Intermediary ImageView #{}",
+                      img.id);
+    }
 
     image_view_create_info.image = img.output_image;
     img.output_image_view =

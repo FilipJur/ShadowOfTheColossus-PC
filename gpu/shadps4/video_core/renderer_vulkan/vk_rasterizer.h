@@ -148,7 +148,7 @@ public:
     /// texture (SOTC_FG_HUDLESS=0 turns it off). Thread of PrepareFrame: that image for the video
     /// out image at `address`, viewed as `format` (layout ShaderReadOnlyOptimal), when it was
     /// drawn since the last call; else a null view.
-    vk::ImageView TakeHudless(VAddr address, vk::Format format);
+    vk::ImageView TakeHudless(VAddr address, vk::Format format, vk::Image* image = nullptr);
 
 private:
     void PrepareRenderState(const GraphicsPipeline* pipeline);

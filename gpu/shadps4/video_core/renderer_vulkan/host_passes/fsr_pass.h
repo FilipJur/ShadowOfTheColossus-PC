@@ -22,7 +22,7 @@ public:
     vk::ImageView Render(vk::CommandBuffer cmdbuf, vk::ImageView input, vk::Extent2D input_size,
                          vk::Extent2D output_size, Settings settings, bool hdr);
 
-    /// sotc: RCAS only, for an image that is already at the output size (DLSS output).
+    /// sotc: RCAS only, for an image that is already at the output size (the upscaler output).
     vk::ImageView Sharpen(vk::CommandBuffer cmdbuf, vk::ImageView input, vk::Extent2D size,
                           float attenuation);
 
@@ -39,10 +39,18 @@ private:
     };
 
     void ResizeAndInvalidate(u32 width, u32 height);
-    void CreateImages(Img& img) const;
+    void CreateImages(Img& img, bool with_intermediary) const;
+    /// sotc: frees the FSR 1 images once the frames recorded with them are done, when the pass
+    /// is switched off at run time; CreateImages recreates them if it is switched on again.
+    void ReleaseImagesWhenIdle();
+    void ReleaseImages();
+    bool ImagesAlive() const;
 
     vk::Device device{};
     u32 num_images{};
+    u32 release_delay{5}; ///< sotc: Render calls waited before ReleaseImages (frames in flight)
+    u32 release_wait{};
+    bool release_pending{};
 
     vk::UniqueDescriptorSetLayout descriptor_set_layout{};
     vk::UniqueDescriptorSet easu_descriptor_set{};
