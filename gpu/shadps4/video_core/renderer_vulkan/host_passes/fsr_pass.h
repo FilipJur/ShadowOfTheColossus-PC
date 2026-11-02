@@ -22,7 +22,7 @@ public:
     vk::ImageView Render(vk::CommandBuffer cmdbuf, vk::ImageView input, vk::Extent2D input_size,
                          vk::Extent2D output_size, Settings settings, bool hdr);
 
-    /// sotc: RCAS only, for an image that is already at the output size (DLSS output).
+    /// sotc: RCAS only, for an image that is already at the output size (the upscaler output).
     vk::ImageView Sharpen(vk::CommandBuffer cmdbuf, vk::ImageView input, vk::Extent2D size,
                           float attenuation);
 
