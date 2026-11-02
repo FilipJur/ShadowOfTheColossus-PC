@@ -109,7 +109,9 @@ public:
             return false;
         }
         Retire(false);
-        // The output is fully rewritten each dispatch.
+        // The output is the caller's image, fully rewritten each dispatch. Its import token
+        // (out_res) retires with the in-flight entry; the image barrier below is recorded on
+        // the caller's command buffer, so the dispatch's writes happen before it.
         const vk::MemoryBarrier2 earlier = {
             .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
             .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
@@ -117,8 +119,8 @@ public:
             .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
         };
         std::vector<vk::ImageMemoryBarrier2> pre;
-        pre.push_back(Barrier(out.image, vk::PipelineStageFlagBits2::eAllCommands,
-                              vk::AccessFlagBits2::eNone, vk::ImageLayout::eUndefined,
+        pre.push_back(Barrier(output.image, vk::PipelineStageFlagBits2::eAllCommands,
+                              vk::AccessFlagBits2::eNone, output.layout,
                               vk::PipelineStageFlagBits2::eComputeShader,
                               vk::AccessFlagBits2::eShaderWrite, vk::ImageLayout::eGeneral));
         if (!shared_ready) {
@@ -176,10 +178,10 @@ public:
         d.dilatedDepth = shared[0].resource;
         d.dilatedMotionVectors = shared[1].resource;
         d.reconstructedPrevNearestDepth = shared[2].resource;
-        // sotc: the output is the backend-owned image; the caller blits from it once this
-        // returns, so it stays General here (the import moved it there above).
+        // sotc: the SDK writes the upscaled frame into the caller's image (UAV); the
+        // backend only keeps the shared (history) images itself.
         FfxVkFsr3_3_1_5Resource out_res{};
-        if (!Import(out_res, out.image, ow, oh, vk::Format::eR16G16B16A16Sfloat, vk::ImageLayout::eGeneral,
+        if (!Import(out_res, output.image, ow, oh, output.format, vk::ImageLayout::eGeneral,
                     FFX_VK_FSR3_3_1_5_RESOURCE_STATE_UNORDERED_ACCESS)) {
             static u32 errors = 0;
             if (errors++ < 5) {
@@ -242,6 +244,17 @@ public:
         // submit of our own. Bridge-owned import views retire with the in-flight entry, whose
         // scheduler tick (Retire) is behind the submission holding this dispatch.
         (void)start;
+        // sotc: the caller samples the output next: leave it ShaderReadOnlyOptimal, as the
+        // FfxApi and Fsr4 backends do.
+        const auto to_sample = Barrier(output.image, vk::PipelineStageFlagBits2::eComputeShader,
+                                       vk::AccessFlagBits2::eShaderWrite,
+                                       vk::ImageLayout::eGeneral,
+                                       vk::PipelineStageFlagBits2::eFragmentShader |
+                                           vk::PipelineStageFlagBits2::eComputeShader,
+                                       vk::AccessFlagBits2::eShaderRead,
+                                       vk::ImageLayout::eShaderReadOnlyOptimal);
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
+                                                   .pImageMemoryBarriers = &to_sample});
         return true;
     }
 
@@ -267,7 +280,7 @@ public:
         for (auto& s : shared) {
             DestroyShared(s);
         }
-        DestroyImage(out);
+        // (no owned output: the SDK writes the caller's image)
         if (context) {
             ffxVkFsr3_3_1_5UpscalerContextDestroy(context);
             context = nullptr;
@@ -291,7 +304,7 @@ public:
         for (auto& s : shared) {
             DestroyShared(s);
         }
-        DestroyImage(out);
+        // (no owned output: the SDK writes the caller's image)
         ffxVkFsr3_3_1_5UpscalerContextDestroy(context);
         context = nullptr;
         bridge = nullptr;
