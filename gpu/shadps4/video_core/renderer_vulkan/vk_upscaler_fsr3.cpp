@@ -211,11 +211,12 @@ public:
         d.preExposure = in.pre_exposure > 0.0f ? in.pre_exposure : 1.0f;
         d.enableSharpening = in.sharpness >= 0.0f ? VK_TRUE : VK_FALSE;
         d.sharpness = std::clamp(in.sharpness, 0.0f, 1.0f);
-        d.reset = in.reset ? VK_TRUE : VK_FALSE;
+        // sotc: a fresh context has no history: the first dispatch resets like a camera cut.
+        const bool first = frame_counter == 0;
         d.cameraNear = in.camera_near;
         d.cameraFar = std::min(in.camera_far, 1.0e6f);
         d.cameraVerticalFovRadians = in.camera_fov_y;
-        d.viewSpaceToMeters = 1.0f;
+        d.reset = (first || in.reset) ? VK_TRUE : VK_FALSE;
         d.frameId = ++frame_counter;
         const auto start = std::chrono::steady_clock::now();
         const FfxVkFsr3_3_1_5Result r = ffxVkFsr3_3_1_5UpscalerContextRecordDispatch(context, &d);
@@ -264,7 +265,7 @@ public:
             (void)g_instance->GetDevice().waitIdle();
         }
         for (auto& s : shared) {
-            DestroyImage(s);
+            DestroyShared(s);
         }
         DestroyImage(out);
         if (context) {
@@ -279,6 +280,24 @@ public:
         supported = false;
         g_instance = nullptr;
     }
+    void DestroyContext() {
+        if (!context) {
+            return;
+        }
+        Retire(true);
+        if (g_instance) {
+            (void)g_instance->GetDevice().waitIdle();
+        }
+        for (auto& s : shared) {
+            DestroyShared(s);
+        }
+        DestroyImage(out);
+        ffxVkFsr3_3_1_5UpscalerContextDestroy(context);
+        context = nullptr;
+        bridge = nullptr;
+        shared_ready = false;
+    }
+
 
     void NoteScheduler(Scheduler& scheduler) {
         scheduler_ = &scheduler;
@@ -378,23 +397,16 @@ private:
         }
     }
 
-    void DestroyContext() {
-        if (!context) {
-            return;
+    void DestroyShared(OwnedImage& img) {
+        // sotc: shared images are imported once with the context (unlike per-dispatch inputs,
+        // which Retire releases): release the import before destroying the image, as Lucas does.
+        if (img.resource.resource) {
+            ffxVkFsr3_3_1_5BridgeReleaseImportedImage(bridge, img.resource);
+            img.resource = {};
         }
-        Retire(true);
-        if (g_instance) {
-            (void)g_instance->GetDevice().waitIdle();
-        }
-        for (auto& s : shared) {
-            DestroyImage(s);
-        }
-        DestroyImage(out);
-        ffxVkFsr3_3_1_5UpscalerContextDestroy(context);
-        context = nullptr;
-        bridge = nullptr;
-        shared_ready = false;
+        DestroyImage(img);
     }
+
 
     bool EnsureContext(u32 render_w, u32 render_h, u32 out_w, u32 out_h) {
         if (context && render_w <= ctx_render_w && render_h <= ctx_render_h && out_w == ctx_out_w &&
