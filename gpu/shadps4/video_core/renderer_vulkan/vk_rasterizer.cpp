@@ -862,7 +862,8 @@ bool Rasterizer::BeginHudless(const GraphicsPipeline* pipeline, const RenderStat
     if (!target.image) {
         if (!CreateHudlessImage(instance, hudless_vo_format, hudless_vo_width, hudless_vo_height,
                                 vk::ImageUsageFlagBits::eColorAttachment |
-                                    vk::ImageUsageFlagBits::eSampled,
+                                    vk::ImageUsageFlagBits::eSampled |
+                                    vk::ImageUsageFlagBits::eTransferSrc, // Fsr3Up::Prepare
                                 target.image, target.rt_view, target.allocation)) {
             return false;
         }
@@ -942,12 +943,15 @@ bool Rasterizer::BeginHudless(const GraphicsPipeline* pipeline, const RenderStat
     return true;
 }
 
-vk::ImageView Rasterizer::TakeHudless(VAddr address, vk::Format format) {
+vk::ImageView Rasterizer::TakeHudless(VAddr address, vk::Format format, vk::Image* image) {
     const auto it = hudless_images.find(address);
     if (it == hudless_images.end() || !std::exchange(it->second.fresh, false)) {
         return {};
     }
     auto& target = it->second;
+    if (image) {
+        *image = target.image;
+    }
     if (!target.read_view) {
         // As the presenter's view of the video out image: alpha excluded.
         auto [result, view] = instance.GetDevice().createImageView(vk::ImageViewCreateInfo{
@@ -2904,9 +2908,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         const char* v = std::getenv("SOTC_FG_HUDLESS");
         return v && v[0] == '1';
     }();
-    if (hudless_on && stage.sw_stage == Shader::SwStage::Fragment && image_bindings.size() == 2 &&
+    if (stage.sw_stage == Shader::SwStage::Fragment && image_bindings.size() == 2 &&
         image_bindings[0].first && image_bindings[1].first &&
-        FrameGen::Current() != FrameGen::Mode::Off) {
+        ((hudless_on && FrameGen::Current() != FrameGen::Mode::Off) || Fsr3Up::SplitsUi())) {
         const u32 ui_i = CompositeUiIndex();
         const auto& ui = texture_cache.GetImage(image_bindings[ui_i].first);
         const auto& scene = texture_cache.GetImage(image_bindings[ui_i ^ 1].first);
