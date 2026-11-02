@@ -27,6 +27,9 @@ Kind Requested() {
     if (u && std::strcmp(u, "ffxapi") == 0) {
         return Kind::FfxApiDll;
     }
+    if (u && std::strcmp(u, "fsr4") == 0) {
+        return Kind::Fsr4;
+    }
     return Kind::None;
 }
 
@@ -45,19 +48,22 @@ Backend* Active() {
     if (kind == Kind::None || !g_instance) {
         return nullptr;
     }
-    std::unique_ptr<Backend> first =
-        kind == Kind::FfxApiDll ? MakeFfxApiDll() : MakeFsr3Builtin();
+    std::unique_ptr<Backend> first = kind == Kind::FfxApiDll  ? MakeFfxApiDll()
+                                     : kind == Kind::Fsr4    ? MakeFsr4()
+                                                             : MakeFsr3Builtin();
     if (first && first->Init(*g_instance)) {
         std::fprintf(stderr, "SOTC upscaler: %s\n", first->Name());
         g_backend = std::move(first);
         return g_backend.get();
     }
-    // FfxApiDll unavailable (no amd_fidelityfx_vk.dll on this host): fall back to the
-    // built-in FSR 3.1, one line.
-    if (kind == Kind::FfxApiDll) {
+    // FfxApiDll unavailable (no amd_fidelityfx_vk.dll on this host), or Fsr4 unavailable
+    // (no fsr4_411 assets, or the GPU lacks INT8 dot products): fall back to the built-in
+    // FSR 3.1, one line.
+    if (kind == Kind::FfxApiDll || kind == Kind::Fsr4) {
         std::unique_ptr<Backend> fallback = MakeFsr3Builtin();
         if (fallback && fallback->Init(*g_instance)) {
-            std::fprintf(stderr, "SOTC upscaler: %s (ffxapi unavailable)\n", fallback->Name());
+            std::fprintf(stderr, "SOTC upscaler: %s (%s unavailable)\n", fallback->Name(),
+                         kind == Kind::Fsr4 ? "fsr4" : "ffxapi");
             g_backend = std::move(fallback);
             return g_backend.get();
         }

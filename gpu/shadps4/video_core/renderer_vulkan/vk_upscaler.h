@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // sotc: shared contract for the temporal upscaler backends: FSR 3.1 built in
-// (vk_upscaler_fsr3.cpp), or AMD's FFX API through a dynamically loaded
-// amd_fidelityfx_vk.dll, which OptiScaler hooks on Windows/Proton (vk_upscaler_ffxapi.cpp).
+// (vk_upscaler_fsr3.cpp), AMD's FFX API through a dynamically loaded
+// amd_fidelityfx_vk.dll, which OptiScaler hooks on Windows/Proton (vk_upscaler_ffxapi.cpp),
+// or FSR 4.1.1 INT8 replayed natively on Vulkan from SPIR-V assets (vk_upscaler_fsr4.cpp).
 // The presenter captures the game's colour/depth/motion vectors once; the active backend
 // consumes them (everything OptiScaler's FFX/NGX translator needs is in Inputs).
-
 #pragma once
 
 #include <memory>
@@ -18,7 +18,7 @@ class Instance;
 
 namespace Vulkan::Upscaler {
 
-enum class Kind { None, Fsr3Builtin, FfxApiDll };
+enum class Kind { None, Fsr3Builtin, FfxApiDll, Fsr4 };
 
 struct Resource {
     vk::Image image;
@@ -56,12 +56,14 @@ public:
 
 std::unique_ptr<Backend> MakeFsr3Builtin(); // defined in vk_upscaler_fsr3.cpp
 std::unique_ptr<Backend> MakeFfxApiDll(); // defined in vk_upscaler_ffxapi.cpp
-Kind Requested(); // SOTC_UPSCALER: "fsr3" -> Fsr3Builtin, "ffxapi" -> FfxApiDll, else None
+std::unique_ptr<Backend> MakeFsr4(); // defined in vk_upscaler_fsr4.cpp
+Kind Requested(); // SOTC_UPSCALER: "fsr3" -> Fsr3Builtin, "ffxapi" -> FfxApiDll,
+                  // "fsr4" -> Fsr4, else None
 // The device-creation hook (call beside Dlssg::OnDeviceCreated in vk_instance.cpp): Active
 // needs the Instance for Backend::Init but takes no arguments, so it is delivered here.
 void OnDeviceCreated(const Instance& instance);
-Backend* Active(); // created+Init'ed lazily on first call; if FfxApiDll Init fails, fall back
-                   // to Fsr3Builtin and log one line; nullptr when None
+Backend* Active(); // created+Init'ed lazily on first call; if FfxApiDll or Fsr4 Init fails,
+                   // fall back to Fsr3Builtin and log one line; nullptr when None
 void Shutdown();
 
 } // namespace Vulkan::Upscaler
