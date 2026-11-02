@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// sotc: AMD FSR 3.1 temporal upscaler, see vk_fsr3up.h.
+// sotc: AMD FSR 3.1 temporal upscaler frontend, see vk_fsr3up.h. Captures the game's inputs
+// each frame (colour in Prepare, depth/motion vectors/jitter/camera via Dlssg::GetFrameInputs
+// and FsrFg::DepthImage) and runs the active Upscaler::Backend (vk_upscaler.h: built-in FSR 3.1,
+// FFX API DLL via OptiScaler, or FSR 4). The backend owns the FFX bridge lifecycle; this file
+// owns the HUD split (upscale_hud.comp), the reactive mask (fsr3_reactive.comp) and the stats.
 
 #include "video_core/renderer_vulkan/vk_fsr3up.h"
 
@@ -10,19 +14,20 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <deque>
 #include <vector>
 #include <vk_mem_alloc.h>
 
-#include <ffx_vk_fsr3_3_1_5_bridge.h>
-
 #include "video_core/renderer_vulkan/vk_dlssg.h"
 #include "video_core/renderer_vulkan/vk_fsrfg.h"
+#include "video_core/renderer_vulkan/vk_upscaler.h"
+
+namespace Vulkan::Upscaler {
+void NoteFsr3Scheduler(Scheduler& scheduler);
+} // namespace Vulkan::Upscaler
 #include "video_core/host_shaders/fsr3_reactive_comp.h"
 #include "video_core/host_shaders/upscale_hud_comp.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
-#include "video_core/sotc_live.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 namespace Vulkan::Fsr3Up {
@@ -41,42 +46,25 @@ struct OwnedImage {
     VmaAllocation alloc{};
     vk::ImageView view;
     vk::ImageView swapped_view; ///< red and blue exchanged (outputs only)
-    FfxVkFsr3_3_1_5Resource resource{}; ///< imported once, with the context
     u32 width{}, height{};
 };
 
-struct InFlight {
-    u64 frame_id;
-    u64 tick;
-    FfxVkFsr3_3_1_5Resource color, depth, mvec, reactive;
-};
-
 const Instance* g_instance{};
-bool wanted = false;
-bool supported = false;
 bool failed = false;
 int log_level = 0; // SOTC_FSR3UP_LOG
 
-FfxVkFsr3_3_1_5UpscalerContext* context{};
-FfxVkFsr3_3_1_5Bridge* bridge{};
-u32 ctx_render_w{}, ctx_render_h{}, ctx_out_w{}, ctx_out_h{};
 // The game image of each presentation frame (command processor thread writes, present thread reads).
 std::array<OwnedImage, kMaxFrames> colors;
 std::array<bool, kMaxFrames> color_ready{};
 std::array<bool, kMaxFrames> color_swapped{}; ///< the game image holds red and blue exchanged
-std::array<OwnedImage, 3> shared; // dilated depth, dilated motion vectors, previous nearest depth
 std::array<OwnedImage, kMaxFrames> outputs;
-u64 frame_counter = 0; // dispatches so far, also the SDK frame id
-bool shared_ready = false;
-Scheduler* retire_scheduler{};
-std::deque<InFlight> in_flight;
 Clock::time_point last_time{};
 float interval_ms = 16.6f;
 
 // sotc: a frame the upscaler skips is shown as the bilinear stretch of the game image (blurry,
 // blocky at 720p), with nothing in the log. Counted per reason and reported every 600 frames
 // when any frame was skipped (always with SOTC_FSR3UP_LOG=1).
-enum Skip { SkipColour, SkipInputs, SkipSize, SkipDlss, SkipError, SkipCount };
+enum Skip { SkipColour, SkipInputs, SkipSize, SkipError, SkipCount };
 std::array<u32, SkipCount> skipped{};
 u32 upscaled = 0;
 
@@ -98,9 +86,9 @@ void CountFrame(int skip) {
     if (missed || log_level >= 1) {
         std::fprintf(stderr,
                      "SOTC FSR3 upscaler: last %u frames %u upscaled, %u bilinear (no colour %u, no "
-                     "depth/motion %u, size %u, DLSS %u, error %u)\n",
+                     "depth/motion %u, size %u, error %u)\n",
                      total, upscaled, missed, skipped[SkipColour], skipped[SkipInputs],
-                     skipped[SkipSize], skipped[SkipDlss], skipped[SkipError]);
+                     skipped[SkipSize], skipped[SkipError]);
     }
     upscaled = 0;
     skipped = {};
@@ -156,26 +144,10 @@ bool CreateImage(OwnedImage& img, vk::Format format, u32 width, u32 height) {
     return true;
 }
 
-/// Hands an image to the SDK; layout and state are what it is in at each dispatch.
-bool Import(FfxVkFsr3_3_1_5Resource& resource, vk::Image image, u32 width, u32 height,
-            vk::Format format, vk::ImageLayout layout, u32 state) {
-    FfxVkFsr3_3_1_5ImportedImageDescription d{};
-    d.image = static_cast<VkImage>(image);
-    d.format = static_cast<VkFormat>(format);
-    d.width = width;
-    d.height = height;
-    d.mipCount = 1;
-    d.arrayLayers = 1;
-    d.layout = static_cast<VkImageLayout>(layout);
-    d.state = state;
-    d.usage = static_cast<VkImageUsageFlags>(kUsage);
-    resource = ffxVkFsr3_3_1_5BridgeImportImage(bridge, &d);
-    return resource.resource != nullptr;
-}
-
 void DestroyImage(OwnedImage& img) {
-    if (bridge && img.resource.resource) {
-        ffxVkFsr3_3_1_5BridgeReleaseImportedImage(bridge, img.resource);
+    if (!g_instance) {
+        img = {};
+        return;
     }
     if (img.view) {
         g_instance->GetDevice().destroyImageView(img.view);
@@ -187,107 +159,6 @@ void DestroyImage(OwnedImage& img) {
         vmaDestroyImage(g_instance->GetAllocator(), img.image, img.alloc);
     }
     img = {};
-}
-
-void Retire(bool wait_all) {
-    while (!in_flight.empty() && retire_scheduler) {
-        const InFlight f = in_flight.front();
-        if (wait_all) {
-            retire_scheduler->Wait(f.tick);
-        } else if (!retire_scheduler->IsFree(f.tick)) {
-            break;
-        }
-        ffxVkFsr3_3_1_5UpscalerContextRetireFrame(context, f.frame_id);
-        ffxVkFsr3_3_1_5BridgeReleaseImportedImage(bridge, f.color);
-        ffxVkFsr3_3_1_5BridgeReleaseImportedImage(bridge, f.depth);
-        ffxVkFsr3_3_1_5BridgeReleaseImportedImage(bridge, f.mvec);
-        if (f.reactive.resource) {
-            ffxVkFsr3_3_1_5BridgeReleaseImportedImage(bridge, f.reactive);
-        }
-        in_flight.pop_front();
-    }
-}
-
-void DestroyContext() {
-    if (!context) {
-        return;
-    }
-    Retire(true);
-    g_instance->GetDevice().waitIdle();
-    for (auto& s : shared) {
-        DestroyImage(s);
-    }
-    for (auto& o : outputs) {
-        DestroyImage(o);
-    }
-    ffxVkFsr3_3_1_5UpscalerContextDestroy(context);
-    context = nullptr;
-    bridge = nullptr;
-    shared_ready = false;
-}
-
-// sotc: an on/off environment switch (unset: `fallback`).
-bool Fsr3Flag(const char* name, bool fallback) {
-    const char* v = std::getenv(name);
-    return v && v[0] ? v[0] != '0' : fallback;
-}
-
-bool EnsureContext(u32 render_w, u32 render_h, u32 out_w, u32 out_h) {
-    if (context && render_w <= ctx_render_w && render_h <= ctx_render_h && out_w == ctx_out_w &&
-        out_h == ctx_out_h) {
-        return true;
-    }
-    DestroyContext();
-    const FfxVkFsr3_3_1_5UpscalerCreateInfo info = {
-        .physicalDevice = static_cast<VkPhysicalDevice>(g_instance->GetPhysicalDevice()),
-        .device = static_cast<VkDevice>(g_instance->GetDevice()),
-        .maxRenderWidth = render_w,
-        .maxRenderHeight = render_h,
-        .maxUpscaleWidth = out_w,
-        .maxUpscaleHeight = out_h,
-        // sotc: the colour input is the game's final, tonemapped frame (8 bits per channel), not
-        // HDR. Flagged as HDR with auto exposure (as it was until 0.70-plus2), FSR 3.1 compared
-        // colours wrongly and dropped its history in motion: grass in blotches, the horse's mane in
-        // steps, while a still scene looked fine (2mg, fork issue #5: "pixelated"). Attract demo,
-        // 720p -> 1080p: finer grass and smooth edges in motion without the flags.
-        // SOTC_FSR3_HDR=1 / SOTC_FSR3_AUTOEXP=1 bring the old flags back.
-        .hdrColorInput = Fsr3Flag("SOTC_FSR3_HDR", false) ? VK_TRUE : VK_FALSE,
-        .autoExposure = Fsr3Flag("SOTC_FSR3_AUTOEXP", false) ? VK_TRUE : VK_FALSE,
-    };
-    const auto start = Clock::now();
-    if (ffxVkFsr3_3_1_5UpscalerContextCreate(&info, &context) != FFX_VK_FSR3_3_1_5_OK) {
-        std::fprintf(stderr, "SOTC FSR3 upscaler: context creation failed, off\n");
-        context = nullptr;
-        return false;
-    }
-    bridge = ffxVkFsr3_3_1_5UpscalerContextGetBridge(context);
-    FfxVkFsr3_3_1_5SharedResourceDescriptions sd{};
-    bool ok = ffxVkFsr3_3_1_5UpscalerContextGetSharedResourceDescriptions(context, &sd) ==
-              FFX_VK_FSR3_3_1_5_OK;
-    const FfxVkFsr3_3_1_5SharedResourceDescription* descs[3] = {
-        &sd.dilatedDepth, &sd.dilatedMotionVectors, &sd.reconstructedPrevNearestDepth};
-    for (int i = 0; ok && i < 3; ++i) {
-        const auto format = static_cast<vk::Format>(descs[i]->format);
-        ok = format != vk::Format::eUndefined &&
-             CreateImage(shared[i], format, descs[i]->width, descs[i]->height) &&
-             Import(shared[i].resource, shared[i].image, shared[i].width, shared[i].height, format,
-                    vk::ImageLayout::eGeneral, FFX_VK_FSR3_3_1_5_RESOURCE_STATE_UNORDERED_ACCESS);
-    }
-    if (!ok) {
-        std::fprintf(stderr, "SOTC FSR3 upscaler: cannot create its images, off\n");
-        DestroyContext();
-        return false;
-    }
-    ctx_render_w = render_w;
-    ctx_render_h = render_h;
-    ctx_out_w = out_w;
-    ctx_out_h = out_h;
-    FfxVkFsr3_3_1_5MemoryUsage usage{};
-    ffxVkFsr3_3_1_5UpscalerContextGetMemoryUsage(context, &usage);
-    std::fprintf(stderr, "SOTC FSR3 upscaler: context %ux%u -> %ux%u, %.0f MB, created in %.0f ms\n",
-                 render_w, render_h, out_w, out_h, usage.totalUsageInBytes / 1048576.0,
-                 std::chrono::duration<double, std::milli>(Clock::now() - start).count());
-    return true;
 }
 
 vk::ImageMemoryBarrier2 Barrier(vk::Image image, vk::PipelineStageFlags2 src_stage,
@@ -365,7 +236,7 @@ bool EnsureHudPipeline() {
         .size = 2 * sizeof(u32),
     };
     if (!hud_shader || set_result != vk::Result::eSuccess) {
-        std::fprintf(stderr, "SOTC FSR3 upscaler: UI pass unavailable, the UI is upscaled too\n");
+        std::fprintf(stderr, "SOTC upscaler: UI pass unavailable, the UI is upscaled too\n");
         return false;
     }
     const vk::DescriptorSetLayout layouts[] = {*set_layout};
@@ -384,7 +255,7 @@ bool EnsureHudPipeline() {
         .addressModeW = vk::SamplerAddressMode::eClampToEdge,
     });
     if (layout_result != vk::Result::eSuccess || sampler_result != vk::Result::eSuccess) {
-        std::fprintf(stderr, "SOTC FSR3 upscaler: UI pass unavailable, the UI is upscaled too\n");
+        std::fprintf(stderr, "SOTC upscaler: UI pass unavailable, the UI is upscaled too\n");
         return false;
     }
     auto [pipeline_result, pipeline] = device.createComputePipelineUnique(
@@ -397,7 +268,7 @@ bool EnsureHudPipeline() {
                 .layout = *layout,
             });
     if (pipeline_result != vk::Result::eSuccess) {
-        std::fprintf(stderr, "SOTC FSR3 upscaler: UI pass unavailable, the UI is upscaled too\n");
+        std::fprintf(stderr, "SOTC upscaler: UI pass unavailable, the UI is upscaled too\n");
         return false;
     }
     hud_set_layout = std::move(set_layout);
@@ -405,20 +276,23 @@ bool EnsureHudPipeline() {
     hud_sampler = std::move(sampler);
     hud_pipeline = std::move(pipeline);
     hud_failed = false;
-    std::fprintf(stderr, "SOTC FSR3 upscaler: the UI layer is put back after upscaling\n");
+    std::fprintf(stderr, "SOTC upscaler: the UI layer is put back after upscaling\n");
     return true;
 }
 
-/// The upscaled frame without the UI (`out`, General) gets the UI back from the game frame.
+/// The upscaled frame without the UI (`out`, ShaderReadOnlyOptimal) gets the UI back from the
+/// game frame (in place: the backend's output image).
 void PutUiBack(vk::CommandBuffer cmdbuf, u32 frame_id, const OwnedImage& out, u32 out_width,
                u32 out_height) {
-    const auto before = Barrier(out.image, vk::PipelineStageFlagBits2::eAllCommands,
-                                vk::AccessFlagBits2::eMemoryWrite, vk::ImageLayout::eGeneral,
-                                vk::PipelineStageFlagBits2::eComputeShader,
-                                vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
-                                vk::ImageLayout::eGeneral);
-    cmdbuf.pipelineBarrier2(
-        vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &before});
+    const auto to_general = Barrier(out.image, vk::PipelineStageFlagBits2::eAllCommands,
+                                    vk::AccessFlagBits2::eMemoryRead,
+                                    vk::ImageLayout::eShaderReadOnlyOptimal,
+                                    vk::PipelineStageFlagBits2::eComputeShader,
+                                    vk::AccessFlagBits2::eShaderRead |
+                                        vk::AccessFlagBits2::eShaderWrite,
+                                    vk::ImageLayout::eGeneral);
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
+                                               .pImageMemoryBarriers = &to_general});
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *hud_pipeline);
     const vk::DescriptorImageInfo with_ui = {
         .sampler = *hud_sampler,
@@ -458,11 +332,18 @@ void PutUiBack(vk::CommandBuffer cmdbuf, u32 frame_id, const OwnedImage& out, u3
     const u32 params[2] = {out_width, out_height};
     cmdbuf.pushConstants(*hud_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(params), params);
     cmdbuf.dispatch((out_width + 7) / 8, (out_height + 7) / 8, 1);
+    const auto to_sample = Barrier(out.image, vk::PipelineStageFlagBits2::eComputeShader,
+                                   vk::AccessFlagBits2::eShaderWrite, vk::ImageLayout::eGeneral,
+                                   vk::PipelineStageFlagBits2::eAllCommands,
+                                   vk::AccessFlagBits2::eShaderRead,
+                                   vk::ImageLayout::eShaderReadOnlyOptimal);
+    cmdbuf.pipelineBarrier2(
+        vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_sample});
 }
 
-// sotc: the reactive mask (fsr3_reactive.comp): pixels the motion vectors do not explain, so FSR
-// 3.1 drops its history there (particles, smoke, blended effects left trails). SOTC_FSR3_REACTIVE=0
-// turns it off; a number 0..1 sets the strongest value (default 0.6).
+// sotc: the reactive mask (fsr3_reactive.comp): pixels the motion vectors do not explain, so the
+// upscaler drops its history there (particles, smoke, blended effects left trails).
+// SOTC_FSR3_REACTIVE=0 turns it off; a number 0..1 sets the strongest value (default 0.6).
 OwnedImage reactive_img;
 std::array<OwnedImage, 2> history; // the game frame of the previous dispatch, ping-pong
 u32 history_index = 0;
@@ -491,7 +372,7 @@ bool EnsureReactive(u32 width, u32 height) {
         const vk::Device device = g_instance->GetDevice();
         if (!(g_instance->GetPhysicalDevice().getFormatProperties(vk::Format::eR8Unorm)
                   .optimalTilingFeatures & vk::FormatFeatureFlagBits::eStorageImage)) {
-            std::fprintf(stderr, "SOTC FSR3 upscaler: no R8 storage images, no reactive mask\n");
+            std::fprintf(stderr, "SOTC upscaler: no R8 storage images, no reactive mask\n");
             return false;
         }
         reactive_shader = CompileSPV(FSR3_REACTIVE_COMP, device);
@@ -511,7 +392,7 @@ bool EnsureReactive(u32 width, u32 height) {
             .pBindings = bindings.data(),
         });
         if (!reactive_shader || set_result != vk::Result::eSuccess) {
-            std::fprintf(stderr, "SOTC FSR3 upscaler: reactive mask unavailable\n");
+            std::fprintf(stderr, "SOTC upscaler: reactive mask unavailable\n");
             return false;
         }
         const vk::PushConstantRange push_range = {
@@ -535,7 +416,7 @@ bool EnsureReactive(u32 width, u32 height) {
             .addressModeW = vk::SamplerAddressMode::eClampToEdge,
         });
         if (layout_result != vk::Result::eSuccess || sampler_result != vk::Result::eSuccess) {
-            std::fprintf(stderr, "SOTC FSR3 upscaler: reactive mask unavailable\n");
+            std::fprintf(stderr, "SOTC upscaler: reactive mask unavailable\n");
             return false;
         }
         auto [pipeline_result, pipeline] = device.createComputePipelineUnique(
@@ -548,7 +429,7 @@ bool EnsureReactive(u32 width, u32 height) {
                     .layout = *layout,
                 });
         if (pipeline_result != vk::Result::eSuccess) {
-            std::fprintf(stderr, "SOTC FSR3 upscaler: reactive mask unavailable\n");
+            std::fprintf(stderr, "SOTC upscaler: reactive mask unavailable\n");
             return false;
         }
         reactive_set_layout = std::move(set_layout);
@@ -556,7 +437,7 @@ bool EnsureReactive(u32 width, u32 height) {
         reactive_sampler = std::move(sampler);
         reactive_pipeline = std::move(pipeline);
         reactive_failed = false;
-        std::fprintf(stderr, "SOTC FSR3 upscaler: reactive mask on (strength %.2f)\n",
+        std::fprintf(stderr, "SOTC upscaler: reactive mask on (strength %.2f)\n",
                      ReactiveStrength());
     }
     if (reactive_img.width != width || reactive_img.height != height) {
@@ -569,7 +450,7 @@ bool EnsureReactive(u32 width, u32 height) {
         if (!CreateImage(reactive_img, vk::Format::eR8Unorm, width, height) ||
             !CreateImage(history[0], kColorFormat, width, height) ||
             !CreateImage(history[1], kColorFormat, width, height)) {
-            std::fprintf(stderr, "SOTC FSR3 upscaler: cannot create the reactive mask images\n");
+            std::fprintf(stderr, "SOTC upscaler: cannot create the reactive mask images\n");
             reactive_failed = true;
             return false;
         }
@@ -578,8 +459,8 @@ bool EnsureReactive(u32 width, u32 height) {
     return true;
 }
 
-/// Writes reactive_img (General, for FSR 3.1 to read) from `color` (ShaderReadOnlyOptimal) and the
-/// motion vectors, and copies `color` to the history for the next frame.
+/// Writes reactive_img (ShaderReadOnlyOptimal after, for the backend to read) from `color`
+/// (ShaderReadOnlyOptimal) and the motion vectors, and copies `color` to the history.
 void RecordReactive(vk::CommandBuffer cmdbuf, const OwnedImage& color, vk::ImageView mvec_view,
                     bool reset) {
     OwnedImage& prev = history[history_index ^ 1];
@@ -628,8 +509,9 @@ void RecordReactive(vk::CommandBuffer cmdbuf, const OwnedImage& color, vk::Image
     cmdbuf.dispatch((color.width + 7) / 8, (color.height + 7) / 8, 1);
     const auto post = Barrier(reactive_img.image, vk::PipelineStageFlagBits2::eComputeShader,
                               vk::AccessFlagBits2::eShaderWrite, vk::ImageLayout::eGeneral,
-                              vk::PipelineStageFlagBits2::eComputeShader,
-                              vk::AccessFlagBits2::eShaderRead, vk::ImageLayout::eGeneral);
+                              vk::PipelineStageFlagBits2::eAllCommands,
+                              vk::AccessFlagBits2::eShaderRead,
+                              vk::ImageLayout::eShaderReadOnlyOptimal);
     cmdbuf.pipelineBarrier2(
         vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &post});
     history_index ^= 1;
@@ -643,23 +525,29 @@ void Init(const Instance& instance) {
     if (const char* l = std::getenv("SOTC_FSR3UP_LOG")) {
         log_level = std::atoi(l);
     }
-    const char* v = std::getenv("SOTC_UPSCALER");
-    wanted = v && (_stricmp(v, "fsr3") == 0 || _stricmp(v, "fsr") == 0 || _stricmp(v, "dlss") == 0);
-    // The depth conversion pipeline of the frame generation does the depth for both.
-    supported = wanted && FsrFg::Supported() &&
-                (instance.GetPhysicalDevice().getFormatProperties(kColorFormat).optimalTilingFeatures &
-                 vk::FormatFeatureFlagBits::eBlitDst);
-    if (wanted) {
-        std::fprintf(stderr, "SOTC FSR3 upscaler: %s\n", supported ? "on" : "not supported here");
+    if (AskedAtStart()) {
+        // sotc: the backend logs its own line (or the fallback); here only whether the frontend
+        // captures inputs at all.
+        std::fprintf(stderr, "SOTC upscaler frontend: inputs %s\n",
+                     Upscaler::Active() ? "captured" : "not captured (backend unavailable)");
     }
 }
 
 bool Wanted() {
-    return supported && !failed && SotcLive::fsr3.load(std::memory_order_relaxed) != 0;
+    return AskedAtStart() && Upscaler::Active() != nullptr && !failed;
 }
 
 bool AskedAtStart() {
-    return wanted;
+    static const bool asked = [] {
+        const char* v = std::getenv("SOTC_UPSCALER");
+        if (!v || !v[0]) {
+            return false;
+        }
+        // sotc: any non-empty SOTC_UPSCALER in {fsr3, ffxapi, fsr4} (Upscaler::Requested); the
+        // backend factory falls back to built-in FSR 3.1 when the asked one is unavailable.
+        return Upscaler::Requested() != Upscaler::Kind::None;
+    }();
+    return asked;
 }
 
 float MipBias() {
@@ -667,7 +555,7 @@ float MipBias() {
         if (const char* v = std::getenv("SOTC_MIP_BIAS")) {
             return static_cast<float>(std::atof(v));
         }
-        if (!supported) {
+        if (!AskedAtStart()) {
             return 0.0f;
         }
         // The game's render size (1080p unless SOTC_RENDER_RES) against the output size.
@@ -687,7 +575,7 @@ float MipBias() {
         const float value = std::max(
             std::log2(static_cast<float>(render_w) / static_cast<float>(out_w)) - 1.0f, -1.0f);
         if (log_level > 0) {
-            std::fprintf(stderr, "SOTC FSR3 upscaler: texture LOD bias %.2f (render %ux%u, output %ux%u)\n",
+            std::fprintf(stderr, "SOTC upscaler: texture LOD bias %.2f (render %ux%u, output %ux%u)\n",
                          value, render_w, render_h, out_w, out_h);
         }
         return value;
@@ -795,6 +683,10 @@ vk::ImageView Dispatch(vk::CommandBuffer cmdbuf, Scheduler& scheduler, u32 frame
     if (!Wanted()) {
         return {};
     }
+    Upscaler::Backend* backend = Upscaler::Active();
+    if (!backend) {
+        return {};
+    }
     if (frame_id >= kMaxFrames || !color_ready[frame_id]) {
         CountFrame(SkipColour);
         return {};
@@ -814,23 +706,11 @@ vk::ImageView Dispatch(vk::CommandBuffer cmdbuf, Scheduler& scheduler, u32 frame
         CountFrame(SkipSize);
         return {};
     }
-    retire_scheduler = &scheduler;
-    // sotc: with DLSS Super Resolution the FSR 3.1 context (its shared images: 64 MB at 720p ->
-    // 1080p, 200-250 MB at 4K) was created and never used; DLSS stays on for the whole session.
-    const bool dlss = Dlssg::SuperResReady();
-    if (!dlss && !EnsureContext(width, height, out_width, out_height)) {
-        failed = true;
-        CountFrame(SkipError);
-        return {};
-    }
-    Retire(false);
     OwnedImage& out = outputs[frame_id];
     if (out.width != out_width || out.height != out_height) {
         DestroyImage(out);
-        if (!CreateImage(out, kColorFormat, out_width, out_height) ||
-            (!dlss && !Import(out.resource, out.image, out_width, out_height, kColorFormat,
-                    vk::ImageLayout::eGeneral, FFX_VK_FSR3_3_1_5_RESOURCE_STATE_UNORDERED_ACCESS))) {
-            std::fprintf(stderr, "SOTC FSR3 upscaler: cannot create the %ux%u output\n", out_width,
+        if (!CreateImage(out, kColorFormat, out_width, out_height)) {
+            std::fprintf(stderr, "SOTC upscaler: cannot create the %ux%u output\n", out_width,
                          out_height);
             DestroyImage(out);
             failed = true;
@@ -846,155 +726,122 @@ vk::ImageView Dispatch(vk::CommandBuffer cmdbuf, Scheduler& scheduler, u32 frame
         }
     }
     last_time = now;
-    const bool reset = frame_counter == 0 || in.reset;
-    const u64 sdk_frame = ++frame_counter;
+    const bool reset = in.reset;
+    // sotc: the backend leaves its output ShaderReadOnlyOptimal (as its contract promises); the
+    // old pass assumed General there, so the output is fully rewritten here first.
+    const auto to_general = Barrier(out.image, vk::PipelineStageFlagBits2::eAllCommands,
+                                    vk::AccessFlagBits2::eNone, vk::ImageLayout::eUndefined,
+                                    vk::PipelineStageFlagBits2::eAllCommands,
+                                    vk::AccessFlagBits2::eMemoryWrite, vk::ImageLayout::eGeneral);
+    cmdbuf.pipelineBarrier2(
+        vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_general});
 
-    // Shared images start in General; the output is fully rewritten.
-    const vk::MemoryBarrier2 earlier = {
-        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
-        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
-    };
-    std::vector<vk::ImageMemoryBarrier2> pre;
-    pre.push_back(Barrier(out.image, vk::PipelineStageFlagBits2::eAllCommands,
-                          vk::AccessFlagBits2::eNone, vk::ImageLayout::eUndefined,
-                          vk::PipelineStageFlagBits2::eComputeShader,
-                          vk::AccessFlagBits2::eShaderWrite, vk::ImageLayout::eGeneral));
-    if (!shared_ready && !dlss) {
-        shared_ready = true;
-        for (auto& sh : shared) {
-            pre.push_back(Barrier(sh.image, vk::PipelineStageFlagBits2::eAllCommands,
-                                  vk::AccessFlagBits2::eNone, vk::ImageLayout::eUndefined,
-                                  vk::PipelineStageFlagBits2::eComputeShader,
-                                  vk::AccessFlagBits2::eShaderWrite, vk::ImageLayout::eGeneral));
-        }
-    }
-    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-        .memoryBarrierCount = 1,
-        .pMemoryBarriers = &earlier,
-        .imageMemoryBarrierCount = static_cast<u32>(pre.size()),
-        .pImageMemoryBarriers = pre.data(),
-    });
-
-    if (dlss) {
-        // sotc: DLSS Super Resolution (Streamline) instead of FSR 3.1 when asked and available.
-        if (Dlssg::SuperResEvaluate(cmdbuf, frame_id, color.image, color.view, kColorFormat, width, height,
-                                    out.image, out.view, kColorFormat, out_width, out_height)) {
-            if (split_ui) {
-                PutUiBack(cmdbuf, frame_id, out, out_width, out_height);
-            }
-            const auto to_sample_dlss = Barrier(
-                out.image, vk::PipelineStageFlagBits2::eAllCommands,
-                vk::AccessFlagBits2::eMemoryWrite, vk::ImageLayout::eGeneral,
-                vk::PipelineStageFlagBits2::eFragmentShader | vk::PipelineStageFlagBits2::eComputeShader,
-                vk::AccessFlagBits2::eShaderRead, vk::ImageLayout::eShaderReadOnlyOptimal);
-            cmdbuf.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
-                                                       .pImageMemoryBarriers = &to_sample_dlss});
-            CountFrame(-1);
-            return color_swapped[frame_id] && out.swapped_view ? out.swapped_view : out.view;
-        }
-        CountFrame(SkipDlss);
-        return {};
-    }
-    // The frame's colour (fp16, ShaderReadOnlyOptimal), depth (R32F, General) and motion vectors
-    // (R16G16F, ShaderReadOnlyOptimal), imported for this dispatch and released once the GPU is done.
-    FfxVkFsr3_3_1_5Resource color_res{}, depth_res{}, mvec_res{}, reactive_res{};
+    // The reactive mask from this colour and the motion vectors (General for the backend here,
+    // ShaderReadOnlyOptimal once recorded).
+    Upscaler::Resource reactive{};
+    bool show_reactive = false;
     if (in.mvec_view && EnsureReactive(width, height)) {
         RecordReactive(cmdbuf, color, in.mvec_view, reset);
-        if (!Import(reactive_res, reactive_img.image, width, height, vk::Format::eR8Unorm,
-                    vk::ImageLayout::eGeneral, FFX_VK_FSR3_3_1_5_RESOURCE_STATE_COMPUTE_READ)) {
-            reactive_res = {};
-        }
+        reactive = {
+            .image = reactive_img.image,
+            .view = reactive_img.view,
+            .format = vk::Format::eR8Unorm,
+            .size = {width, height},
+            .layout = vk::ImageLayout::eShaderReadOnlyOptimal,
+        };
     }
-    if (!Import(color_res, color.image, width, height, kColorFormat,
-                vk::ImageLayout::eShaderReadOnlyOptimal,
-                FFX_VK_FSR3_3_1_5_RESOURCE_STATE_COMPUTE_READ) ||
-        !Import(depth_res, depth, width, height, vk::Format::eR32Sfloat, vk::ImageLayout::eGeneral,
-                FFX_VK_FSR3_3_1_5_RESOURCE_STATE_COMPUTE_READ) ||
-        !Import(mvec_res, in.mvec, width, height, vk::Format::eR16G16Sfloat,
-                vk::ImageLayout::eShaderReadOnlyOptimal,
-                FFX_VK_FSR3_3_1_5_RESOURCE_STATE_COMPUTE_READ)) {
-        static u32 errors = 0;
-        if (errors++ < 5) {
-            std::fprintf(stderr, "SOTC FSR3 upscaler: cannot import the frame inputs\n");
-        }
-        for (auto* r : {&color_res, &depth_res, &mvec_res, &reactive_res}) {
-            if (r->resource) {
-                ffxVkFsr3_3_1_5BridgeReleaseImportedImage(bridge, *r);
-            }
-        }
-        CountFrame(SkipError);
-        return {};
-    }
-    FfxVkFsr3_3_1_5UpscalerDispatchInfo d{};
-    d.commandBuffer = static_cast<VkCommandBuffer>(cmdbuf);
-    d.color = color_res;
-    d.depth = depth_res;
-    d.motionVectors = mvec_res;
-    d.reactive = reactive_res;
-    d.dilatedDepth = shared[0].resource;
-    d.dilatedMotionVectors = shared[1].resource;
-    d.reconstructedPrevNearestDepth = shared[2].resource;
-    d.output = out.resource;
-    // sotc: SOTC_FSR3_JITTER=x|y|xy negates the jitter given to FSR 3.1 (diagnostic: the DLSS
+    // SOTC_FSR3_REACTIVE_VIEW=1 (diagnostic): the reactive mask is shown instead of the frame.
+    static const bool show_reactive_env = [] {
+        const char* v = std::getenv("SOTC_FSR3_REACTIVE_VIEW");
+        return v && v[0] == '1';
+    }();
+    show_reactive = show_reactive_env && reactive.image != vk::Image{};
+
+    Upscaler::Inputs inputs{};
+    inputs.color = {
+        .image = color.image,
+        .view = color.view,
+        .format = kColorFormat,
+        .size = {width, height},
+        .layout = vk::ImageLayout::eShaderReadOnlyOptimal,
+    };
+    inputs.depth = {
+        .image = depth,
+        .view = {},
+        .format = vk::Format::eR32Sfloat,
+        .size = {depth_w, depth_h},
+        .layout = vk::ImageLayout::eGeneral,
+    };
+    inputs.motion_vectors = {
+        .image = in.mvec,
+        .view = in.mvec_view,
+        .format = vk::Format::eR16G16Sfloat,
+        .size = {in.width, in.height},
+        .layout = vk::ImageLayout::eShaderReadOnlyOptimal,
+    };
+    inputs.reactive = reactive;
+    inputs.render_size = {width, height};
+    inputs.output_size = {out_width, out_height};
+    // sotc: SOTC_FSR3_JITTER=x|y|xy negates the jitter given to the upscaler (diagnostic: the DLSS
     // convention is used as is; a wrong sign makes FSR 3.1 reject its history, edges stay stepped).
     static const std::pair<float, float> jitter_sign = [] {
         const char* v = std::getenv("SOTC_FSR3_JITTER");
         const bool x = v && std::strchr(v, 'x'), y = v && std::strchr(v, 'y');
         return std::pair{x ? -1.0f : 1.0f, y ? -1.0f : 1.0f};
     }();
-    d.jitterOffsetX = in.jitter[0] * jitter_sign.first;
-    d.jitterOffsetY = in.jitter[1] * jitter_sign.second;
-    // The game's motion vectors are curUV - prevUV; FSR 3 wants prev - cur, in render pixels.
-    d.motionVectorScaleX = -static_cast<float>(width);
-    d.motionVectorScaleY = -static_cast<float>(height);
-    d.renderWidth = width;
-    d.renderHeight = height;
-    d.upscaleWidth = out_width;
-    d.upscaleHeight = out_height;
-    d.frameTimeMilliseconds = interval_ms;
-    d.preExposure = 1.0f;
-    d.enableSharpening = VK_FALSE;
-    d.reset = reset ? VK_TRUE : VK_FALSE;
-    d.cameraNear = in.z_near;
-    d.cameraFar = std::min(in.z_far, 1.0e6f);
-    d.cameraVerticalFovRadians = in.fov_y;
-    d.viewSpaceToMeters = 1.0f;
-    d.frameId = sdk_frame;
-    const FfxVkFsr3_3_1_5Result r = ffxVkFsr3_3_1_5UpscalerContextRecordDispatch(context, &d);
-    in_flight.push_back(
-        {sdk_frame, scheduler.CurrentTick(), color_res, depth_res, mvec_res, reactive_res});
-    if (r != FFX_VK_FSR3_3_1_5_OK) {
+    inputs.jitter_x = in.jitter[0] * jitter_sign.first;
+    inputs.jitter_y = in.jitter[1] * jitter_sign.second;
+    // The game's motion vectors are curUV - prevUV; FSR wants prev - cur, in render pixels.
+    inputs.mv_scale_x = -static_cast<float>(width);
+    inputs.mv_scale_y = -static_cast<float>(height);
+    inputs.frame_time_ms = interval_ms;
+    inputs.pre_exposure = 1.0f;
+    inputs.sharpness = -1.0f; // disabled: the presenter sharpens over the output (RCAS setting)
+    inputs.reset = reset;
+    // The colour input is the game's final, tonemapped frame (8 bits per channel), not HDR.
+    inputs.hdr = false;
+    inputs.camera_near = in.z_near;
+    inputs.camera_far = in.z_far;
+    inputs.camera_fov_y = in.fov_y;
+    inputs.depth_inverted = in.depth_inverted;
+    inputs.depth_infinite = false;
+
+    Upscaler::NoteFsr3Scheduler(scheduler);
+    Upscaler::Resource out_res{
+        .image = out.image,
+        .view = out.view,
+        .format = kColorFormat,
+        .size = {out_width, out_height},
+        .layout = vk::ImageLayout::eGeneral,
+    };
+    if (log_level >= 1) {
+        static u64 logged = 0;
+        if (++logged % 600 == 1 || logged < 4) {
+            std::fprintf(stderr,
+                         "SOTC upscaler: frame %llu %ux%u -> %ux%u jitter %.3f %.3f px near %.3f "
+                         "far %.1f fov %.3f reset %d frame time %.1f ms\n",
+                         static_cast<unsigned long long>(logged), width, height, out_width,
+                         out_height, in.jitter[0], in.jitter[1], in.z_near, in.z_far, in.fov_y,
+                         reset ? 1 : 0, interval_ms);
+        }
+    }
+    if (!backend->Dispatch(cmdbuf, inputs, out_res)) {
         static u32 errors = 0;
         if (errors++ < 5) {
-            std::fprintf(stderr, "SOTC FSR3 upscaler: dispatch failed (%d)\n", static_cast<int>(r));
+            std::fprintf(stderr, "SOTC upscaler: %s dispatch failed\n", backend->Name());
         }
         CountFrame(SkipError);
         return {};
     }
-    if (log_level >= 1 && (sdk_frame % 600 == 1 || sdk_frame < 4)) {
-        std::fprintf(stderr,
-                     "SOTC FSR3 upscaler: frame %llu %ux%u -> %ux%u jitter %.3f %.3f px near %.3f "
-                     "far %.1f fov %.3f reset %d frame time %.1f ms\n",
-                     static_cast<unsigned long long>(sdk_frame), width, height, out_width,
-                     out_height, in.jitter[0], in.jitter[1], in.z_near, in.z_far, in.fov_y,
-                     reset ? 1 : 0, interval_ms);
-    }
-    // SOTC_FSR3_REACTIVE_VIEW=1 (diagnostic): the reactive mask is shown instead of the frame.
-    static const bool show_reactive = [] {
-        const char* v = std::getenv("SOTC_FSR3_REACTIVE_VIEW");
-        return v && v[0] == '1';
-    }();
-    if (show_reactive && reactive_res.resource) {
+    if (show_reactive) {
         const std::array pre_view{
-            Barrier(reactive_img.image, vk::PipelineStageFlagBits2::eComputeShader,
-                    vk::AccessFlagBits2::eShaderRead, vk::ImageLayout::eGeneral,
+            Barrier(reactive_img.image, vk::PipelineStageFlagBits2::eAllCommands,
+                    vk::AccessFlagBits2::eShaderRead, vk::ImageLayout::eShaderReadOnlyOptimal,
                     vk::PipelineStageFlagBits2::eBlit, vk::AccessFlagBits2::eTransferRead,
                     vk::ImageLayout::eGeneral),
             Barrier(out.image, vk::PipelineStageFlagBits2::eComputeShader,
                     vk::AccessFlagBits2::eShaderWrite, vk::ImageLayout::eGeneral,
-                    vk::PipelineStageFlagBits2::eBlit, vk::AccessFlagBits2::eTransferWrite,
+                    vk::PipelineStageFlagBits2::eBlit, vk::AccessFlagBits2::eTransferRead,
                     vk::ImageLayout::eGeneral),
         };
         cmdbuf.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 2,
@@ -1009,24 +856,24 @@ vk::ImageView Dispatch(vk::CommandBuffer cmdbuf, Scheduler& scheduler, u32 frame
         };
         cmdbuf.blitImage(reactive_img.image, vk::ImageLayout::eGeneral, out.image,
                          vk::ImageLayout::eGeneral, view_blit, vk::Filter::eNearest);
-        const auto post_view = Barrier(out.image, vk::PipelineStageFlagBits2::eBlit,
-                                       vk::AccessFlagBits2::eTransferWrite, vk::ImageLayout::eGeneral,
-                                       vk::PipelineStageFlagBits2::eComputeShader,
-                                       vk::AccessFlagBits2::eShaderWrite, vk::ImageLayout::eGeneral);
+        const auto post_view =
+            Barrier(out.image, vk::PipelineStageFlagBits2::eBlit,
+                    vk::AccessFlagBits2::eTransferWrite, vk::ImageLayout::eGeneral,
+                    vk::PipelineStageFlagBits2::eFragmentShader |
+                        vk::PipelineStageFlagBits2::eComputeShader,
+                    vk::AccessFlagBits2::eShaderRead, vk::ImageLayout::eShaderReadOnlyOptimal);
         cmdbuf.pipelineBarrier2(
             vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &post_view});
-    } else if (split_ui) {
-        PutUiBack(cmdbuf, frame_id, out, out_width, out_height);
+        CountFrame(-1);
+        return color_swapped[frame_id] && out.swapped_view ? out.swapped_view : out.view;
     }
-    const auto to_sample = Barrier(out.image, vk::PipelineStageFlagBits2::eComputeShader,
-                                   vk::AccessFlagBits2::eShaderWrite, vk::ImageLayout::eGeneral,
-                                   vk::PipelineStageFlagBits2::eFragmentShader |
-                                       vk::PipelineStageFlagBits2::eComputeShader,
-                                   vk::AccessFlagBits2::eShaderRead,
-                                   vk::ImageLayout::eShaderReadOnlyOptimal);
-    cmdbuf.pipelineBarrier2(
-        vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_sample});
+    if (split_ui) {
+        PutUiBack(cmdbuf, frame_id, out, out_width, out_height);
+        CountFrame(-1);
+        return color_swapped[frame_id] && out.swapped_view ? out.swapped_view : out.view;
+    }
     CountFrame(-1);
+    // sotc: the backend leaves its output ShaderReadOnlyOptimal: the presenter samples it next.
     return color_swapped[frame_id] && out.swapped_view ? out.swapped_view : out.view;
 }
 
