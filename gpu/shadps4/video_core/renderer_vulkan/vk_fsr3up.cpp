@@ -557,7 +557,7 @@ void Shutdown() {
     history_index = 0;
     if (hud_shader) {
         g_instance->GetDevice().destroyShaderModule(hud_shader);
-        hud_shader = {};
+        hud_shader = vk::ShaderModule{};
     }
     hud_pipeline.reset();
     hud_layout.reset();
@@ -566,7 +566,7 @@ void Shutdown() {
     hud_failed = false;
     if (reactive_shader) {
         g_instance->GetDevice().destroyShaderModule(reactive_shader);
-        reactive_shader = {};
+        reactive_shader = vk::ShaderModule{};
     }
     reactive_pipeline.reset();
     reactive_layout.reset();
@@ -785,10 +785,11 @@ vk::ImageView Dispatch(vk::CommandBuffer cmdbuf, Scheduler& scheduler, u32 frame
         vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_general});
 
     // The reactive mask from this colour and the motion vectors (General for the backend here,
-    // ShaderReadOnlyOptimal once recorded).
+    // ShaderReadOnlyOptimal once recorded). Fsr4 computes reactivity inside its replay.
     Upscaler::Resource reactive{};
     bool show_reactive = false;
-    if (in.mvec_view && EnsureReactive(width, height)) {
+    if (in.mvec_view && backend->GetKind() != Upscaler::Kind::Fsr4 &&
+        EnsureReactive(width, height)) {
         RecordReactive(cmdbuf, color, in.mvec_view, reset);
         reactive = {
             .image = reactive_img.image,
