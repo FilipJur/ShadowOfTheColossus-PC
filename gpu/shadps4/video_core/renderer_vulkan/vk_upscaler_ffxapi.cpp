@@ -311,10 +311,9 @@ public:
         desc.reactive = reactive;
         desc.transparencyAndComposition = composition;
         desc.output = out;
-        // The contract's jitter is render pixels; the dispatch wants render/output ratios.
-        desc.jitterOffset = {in.render_size.width ? in.jitter_x / float(in.render_size.width) : 0.f,
-                             in.render_size.height ? -in.jitter_y / float(in.render_size.height)
-                                                   : 0.f};
+        // Subpixel pixels, as the presenter feeds them: the core normalises by the motion
+        // vector target size itself (ffx_fsr3upscaler.cpp motionVectorJitterCancellation).
+        desc.jitterOffset = {in.jitter_x, in.jitter_y};
         desc.motionVectorScale = {in.mv_scale_x, in.mv_scale_y};
         desc.renderSize = {in.render_size.width, in.render_size.height};
         desc.upscaleSize = {in.output_size.width, in.output_size.height};
@@ -417,7 +416,7 @@ private:
     }
 
     static uint32_t CreateFlags(const Inputs& in) {
-        uint32_t flags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE;
+        uint32_t flags = in.hdr ? FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE : 0;
         if (in.depth_inverted) {
             flags |= FFX_UPSCALE_ENABLE_DEPTH_INVERTED;
         }
