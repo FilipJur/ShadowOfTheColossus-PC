@@ -585,8 +585,8 @@ Presenter::~Presenter() {
     // sotc: the temporal upscaler owns device images and pipelines; free them here, while the
     // Instance (device, allocator) is still alive.
     (void)device.waitIdle();
+    Upscaler::Shutdown(); // backends first: they release views onto the frontend's images
     Fsr3Up::Shutdown();
-    Upscaler::Shutdown();
     for (auto& frame : present_frames) {
         vmaDestroyImage(instance.GetAllocator(), frame.image, frame.allocation);
         device.destroyImageView(frame.image_view);
