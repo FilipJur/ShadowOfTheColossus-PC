@@ -366,7 +366,8 @@ public:
         query.renderWidth = render_width;
         query.displayWidth = output_width;
         query.pOutPhaseCount = &phases;
-        if (api_.query(&context_, &query.header) != FFX_API_RETURN_OK || phases <= 0) {
+        ffxContext context = context_; // by handle: the query only reads through it.
+        if (api_.query(&context, &query.header) != FFX_API_RETURN_OK || phases <= 0) {
             return 0;
         }
         return static_cast<s32>(phases);
@@ -378,8 +379,8 @@ public:
             context_ = nullptr;
         }
         api_.Unload();
-        render_size_ = {};
-        output_size_ = {};
+        render_size_ = vk::Extent2D{0, 0};
+        output_size_ = vk::Extent2D{0, 0};
         inited_ = false;
     }
 
@@ -402,7 +403,7 @@ private:
         flags_ = want_flags;
         ffxCreateContextDescUpscale create{};
         create.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
-        create.header.pNext = &backend_;
+        create.header.pNext = reinterpret_cast<ffxApiHeader*>(&backend_);
         create.flags = flags_;
         create.maxRenderSize = {std::max(render_size_.width, 1u), std::max(render_size_.height, 1u)};
         create.maxUpscaleSize = {std::max(output_size_.width, 1u), std::max(output_size_.height, 1u)};
