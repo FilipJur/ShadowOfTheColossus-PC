@@ -218,7 +218,8 @@ public:
         d.cameraNear = in.camera_near;
         d.cameraFar = std::min(in.camera_far, 1.0e6f);
         d.cameraVerticalFovRadians = in.camera_fov_y;
-        d.reset = (first || in.reset) ? VK_TRUE : VK_FALSE;
+        d.reset = (first || reset_pending || in.reset) ? VK_TRUE : VK_FALSE;
+        reset_pending = false;
         d.frameId = ++frame_counter;
         const auto start = std::chrono::steady_clock::now();
         const FfxVkFsr3_3_1_5Result r = ffxVkFsr3_3_1_5UpscalerContextRecordDispatch(context, &d);
@@ -426,6 +427,7 @@ private:
             out_h == ctx_out_h) {
             return true;
         }
+        reset_pending = true; // fresh history: ignore it on the next dispatch
         DestroyContext();
         const FfxVkFsr3_3_1_5UpscalerCreateInfo info = {
             .physicalDevice = static_cast<VkPhysicalDevice>(g_instance->GetPhysicalDevice()),
@@ -496,7 +498,8 @@ private:
     u32 ctx_render_w{}, ctx_render_h{}, ctx_out_w{}, ctx_out_h{};
     std::array<OwnedImage, 3> shared; // dilated depth, dilated motion vectors, previous near depth
     bool shared_ready{};
-    OwnedImage out; // backend-owned output: dispatch target, caller blits from it
+    // (no owned output: the SDK writes the caller's image, fully rewritten each dispatch)
+    bool reset_pending = true; // fresh context (Init never dispatched): ignore history next time
     u64 frame_counter{};
     std::deque<InFlight> in_flight;
 };
