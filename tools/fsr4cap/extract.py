@@ -70,6 +70,11 @@ for cap in sorted(glob.glob(os.path.join(root, 'capture_*'))):
     frame = re.split(r'MARK (?:frame \d+|end)\n', trace.split(mark)[1])[0]
     disp = re.findall(r'DISPATCH #\d+ cs=(\w+) root=\w+ groups=(\d+),(\d+),(\d+)\n((?:  .*\n)*)', frame)
     names = [shader_name(os.path.join(cap, f'cs_{h}.dxil')) for h, *_ in disp]
+    # 4.1.1b (RDNA2 fix): the postpass DXIL has no model name string, so shader_name() falls
+    # back to 'spd'. The dispatch before the final 'rcas' is the postpass: rename by position,
+    # only when it was the fallback.
+    if len(names) >= 2 and names[-1] == 'rcas' and names[-2] == 'spd':
+        names[-2] = 'postpass'
     if names != SEQUENCE:
         fail(f'{cap}: sequence {names}')
         continue
@@ -116,13 +121,19 @@ for key, entry in sorted(sets.items()):
         subprocess.run([dxil_spirv, path, *FLAGS, '--output', spv], check=True, stderr=subprocess.DEVNULL)
         if name == 'postpass':
             # Stores through workgroup memory (bit-exact, ~2.3x faster): postpass_lds.py.
-            os.replace(spv, os.path.join(d, 'postpass_orig.spv'))
-            asm = subprocess.run(['spirv-dis', os.path.join(d, 'postpass_orig.spv')], check=True,
-                                 capture_output=True, text=True).stdout
-            lds = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), 'postpass_lds.py')],
-                                 input=asm, check=True, capture_output=True, text=True).stdout
-            subprocess.run(['spirv-as', '--target-env', 'spv1.3', '-', '-o', spv], input=lds, check=True,
-                           text=True)
+            # The 4.1.1b postpass is recompiled and may not match the rewrite: on failure
+            # keep the untouched dxil-spirv output (same 32x32-tile dispatch shape).
+            try:
+                os.replace(spv, os.path.join(d, 'postpass_orig.spv'))
+                asm = subprocess.run(['spirv-dis', os.path.join(d, 'postpass_orig.spv')], check=True,
+                                     capture_output=True, text=True).stdout
+                lds = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), 'postpass_lds.py')],
+                                     input=asm, check=True, capture_output=True, text=True).stdout
+                subprocess.run(['spirv-as', '--target-env', 'spv1.3', '-', '-o', spv], input=lds, check=True,
+                               text=True)
+            except subprocess.CalledProcessError:
+                print(f'{key}: postpass_lds.py rewrite failed, keeping dxil-spirv postpass.spv')
+                os.replace(os.path.join(d, 'postpass_orig.spv'), spv)
     open(os.path.join(d, 'initializer.bin'), 'wb').write(entry['init'])
     print(f'{key}: {len(entry["dxil"])} shaders, initializer {hashlib.sha256(entry["init"]).hexdigest()[:12]}, '
           f'from {len(entry["caps"])} captures')
