@@ -746,7 +746,7 @@ vk::ImageView Dispatch(vk::CommandBuffer cmdbuf, Scheduler& scheduler, u32 frame
             .image = reactive_img.image,
             .view = reactive_img.view,
             .format = vk::Format::eR8Unorm,
-            .size = {width, height},
+            .size = vk::Extent2D{width, height},
             .layout = vk::ImageLayout::eShaderReadOnlyOptimal,
         };
     }
@@ -762,26 +762,26 @@ vk::ImageView Dispatch(vk::CommandBuffer cmdbuf, Scheduler& scheduler, u32 frame
         .image = color.image,
         .view = color.view,
         .format = kColorFormat,
-        .size = {width, height},
+        .size = vk::Extent2D{width, height},
         .layout = vk::ImageLayout::eShaderReadOnlyOptimal,
     };
     inputs.depth = {
         .image = depth,
         .view = {},
         .format = vk::Format::eR32Sfloat,
-        .size = {depth_w, depth_h},
+        .size = vk::Extent2D{depth_w, depth_h},
         .layout = vk::ImageLayout::eGeneral,
     };
     inputs.motion_vectors = {
         .image = in.mvec,
         .view = in.mvec_view,
         .format = vk::Format::eR16G16Sfloat,
-        .size = {in.width, in.height},
+        .size = vk::Extent2D{in.width, in.height},
         .layout = vk::ImageLayout::eShaderReadOnlyOptimal,
     };
     inputs.reactive = reactive;
-    inputs.render_size = {width, height};
-    inputs.output_size = {out_width, out_height};
+    inputs.render_size = vk::Extent2D{width, height};
+    inputs.output_size = vk::Extent2D{out_width, out_height};
     // sotc: SOTC_FSR3_JITTER=x|y|xy negates the jitter given to the upscaler (diagnostic: the DLSS
     // convention is used as is; a wrong sign makes FSR 3.1 reject its history, edges stay stepped).
     static const std::pair<float, float> jitter_sign = [] {
@@ -811,7 +811,7 @@ vk::ImageView Dispatch(vk::CommandBuffer cmdbuf, Scheduler& scheduler, u32 frame
         .image = out.image,
         .view = out.view,
         .format = kColorFormat,
-        .size = {out_width, out_height},
+        .size = vk::Extent2D{out_width, out_height},
         .layout = vk::ImageLayout::eGeneral,
     };
     if (log_level >= 1) {

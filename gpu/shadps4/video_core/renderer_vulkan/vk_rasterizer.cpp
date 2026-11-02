@@ -42,6 +42,7 @@
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
+#include "video_core/renderer_vulkan/vk_fsr3up.h"
 #include "video_core/renderer_vulkan/vk_framegen.h"
 // After vk_common.h (via the headers above), which sets the Vulkan header defines first.
 #include <vk_mem_alloc.h>

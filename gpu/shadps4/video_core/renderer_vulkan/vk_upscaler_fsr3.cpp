@@ -35,6 +35,7 @@ struct OwnedImage {
     vk::Image image;
     VmaAllocation alloc{};
     vk::ImageView view;
+    FfxVkFsr3_3_1_5Resource resource{}; ///< bridge import token for shared images (dispatch inputs)
     u32 width{}, height{};
 };
 
@@ -178,7 +179,7 @@ public:
         // sotc: the output is the backend-owned image; the caller blits from it once this
         // returns, so it stays General here (the import moved it there above).
         FfxVkFsr3_3_1_5Resource out_res{};
-        if (!Import(out_res, out.image, ow, oh, out.format, vk::ImageLayout::eGeneral,
+        if (!Import(out_res, out.image, ow, oh, vk::Format::eR16G16B16A16Sfloat, vk::ImageLayout::eGeneral,
                     FFX_VK_FSR3_3_1_5_RESOURCE_STATE_UNORDERED_ACCESS)) {
             static u32 errors = 0;
             if (errors++ < 5) {
@@ -260,7 +261,7 @@ public:
         }
         Retire(true);
         if (g_instance) {
-            g_instance->GetDevice().waitIdle();
+            (void)g_instance->GetDevice().waitIdle();
         }
         for (auto& s : shared) {
             DestroyImage(s);
@@ -383,7 +384,7 @@ private:
         }
         Retire(true);
         if (g_instance) {
-            g_instance->GetDevice().waitIdle();
+            (void)g_instance->GetDevice().waitIdle();
         }
         for (auto& s : shared) {
             DestroyImage(s);
