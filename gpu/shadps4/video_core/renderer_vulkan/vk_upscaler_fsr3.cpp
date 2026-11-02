@@ -145,8 +145,7 @@ public:
         FfxVkFsr3_3_1_5Resource color_res{}, depth_res{}, mvec_res{}, reactive_res{};
         if (in.reactive.image != vk::Image{} &&
             !Import(reactive_res, in.reactive.image, rw, rh, in.reactive.format,
-                    vk::ImageLayout::eGeneral,
-                    FFX_VK_FSR3_3_1_5_RESOURCE_STATE_COMPUTE_READ)) {
+                    in.reactive.layout, FFX_VK_FSR3_3_1_5_RESOURCE_STATE_COMPUTE_READ)) {
             reactive_res = {};
         }
         if (!Import(color_res, in.color.image, rw, rh, in.color.format,
