@@ -16,6 +16,7 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_dlssg.h"
+#include "video_core/renderer_vulkan/vk_fsr3up.h"
 #include "video_core/renderer_vulkan/vk_framegen.h"
 #include "video_core/renderer_vulkan/vk_fsrfg.h"
 #include "video_core/sotc_fps_cap.h"
@@ -108,6 +109,16 @@ bool CanBlitToSwapchain(const vk::PhysicalDevice physical_device, vk::Format for
 [[nodiscard]] vk::ImageBlit MakeImageBlitStretch(s32 frame_width, s32 frame_height,
                                                  s32 swapchain_width, s32 swapchain_height) {
     return MakeImageBlit(frame_width, frame_height, swapchain_width, swapchain_height, 0, 0);
+}
+
+// sotc: sharpening as the in-game menu set it (sotc_live.h), else as it came in.
+static void ApplyLiveRcas(HostPasses::FsrPass::Settings& settings) {
+    if (const int live = SotcLive::rcas.load(std::memory_order_relaxed); live != -1) {
+        settings.use_rcas = live >= 0;
+        if (live >= 0) {
+            settings.rcas_attenuation = static_cast<float>(live) / 1000.f;
+        }
+    }
 }
 
 static vk::Rect2D FitImage(s32 frame_width, s32 frame_height, s32 swapchain_width,
@@ -533,6 +544,7 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
 
     fsr_pass.Create(device, instance.GetAllocator(), num_images);
     fsr_pass_hudless.Create(device, instance.GetAllocator(), num_images);
+    sharpen_pass.Create(device, instance.GetAllocator(), num_images);
     pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
 
     // sotc: the pipeline cache is read here, once frames can be presented, and blank frames with
@@ -820,6 +832,38 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 
     // Continue with host-side passes that draw the displayed (scaled) frame.
 
+    // sotc: the game frame without the HUD (Rasterizer::TakeHudless), for the upscaler and for
+    // frame generation below.
+    vk::Image hudless_image{};
+    const vk::ImageView hudless_view_all =
+        rasterizer->TakeHudless(cpu_address, view_info.format, &hudless_image);
+
+    // sotc: temporal upscaler (SOTC_UPSCALER=fsr3/ffxapi/fsr4): the game image goes to its colour
+    // input here; the present thread upscales it (Presenter::Present) over the bilinear frame
+    // made below.
+    if (Fsr3Up::Wanted()) {
+        runtime.Transit(&image, vk::ImageLayout::eTransferSrcOptimal,
+                        vk::PipelineStageFlagBits2::eBlit, vk::AccessFlagBits2::eTransferRead);
+        runtime.FlushBarriers();
+        const vk::Format native = image.info.pixel_format;
+        // The image's channel order is not the one the frame is shown with (B10G10R10 vs R10G10B10).
+        const auto is_bgr = [](vk::Format f) {
+            return f == vk::Format::eB8G8R8A8Srgb || f == vk::Format::eA2R10G10B10UnormPack32;
+        };
+        const auto is_rgb = [](vk::Format f) {
+            return f == vk::Format::eR8G8B8A8Srgb || f == vk::Format::eA2B10G10R10UnormPack32;
+        };
+        const bool swap = (is_rgb(native) && is_bgr(view_info.format)) ||
+                          (is_bgr(native) && is_rgb(view_info.format));
+        static bool logged_formats = false;
+        if (!std::exchange(logged_formats, true)) {
+            std::fprintf(stderr, "SOTC upscaler: game image %s, shown as %s\n",
+                         vk::to_string(native).c_str(), vk::to_string(view_info.format).c_str());
+        }
+        Fsr3Up::Prepare(cmdbuf, frame->id, image.GetImage(), image_size.width, image_size.height,
+                        swap, hudless_image);
+    }
+
     // sotc: DLSS super resolution (SOTC_UPSCALER=dlss): the game's scene before its UI, upscaled
     // to the frame's size; the post process pass puts the UI layer back over it. Frames without
     // that scene (menus, loading screens) are presented as before.
@@ -897,8 +941,13 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         pp_pass.Render(cmdbuf, scene, scene_size, *frame, pp_settings, upscaled.ui, upscaled.sky);
         upscaled_scene = upscaled.scene_low ? vk::ImageView{} : scene;
     } else {
+        // sotc: FSR 1 reads the frame in compute shaders (EASU), not in the fragment shader of
+        // the post process pass: a barrier for the fragment stage alone let it read the frame
+        // before the game finished writing it, and the game's next frame write over it while it
+        // still read (torn, blocky image with FSR 1 on AMD cards, fine with bilinear, #209).
         runtime.Transit(&image, vk::ImageLayout::eShaderReadOnlyOptimal,
-                        vk::PipelineStageFlagBits2::eFragmentShader,
+                        vk::PipelineStageFlagBits2::eFragmentShader |
+                            vk::PipelineStageFlagBits2::eComputeShader,
                         vk::AccessFlagBits2::eShaderRead);
         runtime.FlushBarriers();
 
@@ -906,14 +955,20 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         if (const int live = SotcLive::fsr1.load(std::memory_order_relaxed); live >= 0) {
             fsr_settings.enable = live != 0;
         }
-        if (const int live = SotcLive::rcas.load(std::memory_order_relaxed); live != -1) {
-            fsr_settings.use_rcas = live >= 0;
-            if (live >= 0) {
-                fsr_settings.rcas_attenuation = static_cast<float>(live) / 1000.f;
-            }
+        ApplyLiveRcas(fsr_settings);
+        // sotc: with the temporal upscaler, a frame without depth and motion inputs (menus,
+        // loading screens) is not upscaled by it and went out as a bilinear stretch of the small
+        // render: blurry, blocky text and logos (2mg, fork issue #5). Such a frame gets FSR 1 and
+        // the sharpening setting instead; frames the temporal upscaler takes skip this pass.
+        HostPasses::FsrPass::Settings frame_fsr = fsr_settings;
+        if (Fsr3Up::Wanted() && !frame_fsr.enable) {
+            Dlssg::FrameInputs inputs{};
+            frame_fsr.enable = !Dlssg::GetFrameInputs(frame->id, inputs);
         }
+        const vk::ImageView game_view = image_view;
         image_view = fsr_pass.Render(cmdbuf, image_view, image_size,
-                                     {frame->width, frame->height}, fsr_settings, frame->is_hdr);
+                                     {frame->width, frame->height}, frame_fsr, frame->is_hdr);
+        DebugState.is_using_fsr = image_view != game_view;
 
         // Vulkan has no sRGB variant of the 10-bit format, so an A2R10G10B10Srgb buffer reaches
         // the post process pass still sRGB encoded and has to be decoded there instead.
@@ -930,7 +985,16 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // HUD interpolated with FSR 1 on (letters shook, 27 Oct). With DLSS super resolution the DLSS
     // output is the frame without its HUD (the UI layer is only put over it here), so it is used
     // instead.
-    if (const vk::ImageView hudless_view = rasterizer->TakeHudless(cpu_address, view_info.format)) {
+    // (The upscaler already took its copy above via hudless_view_all/hudless_image.)
+    const vk::ImageView hudless_view = hudless_view_all;
+    // sotc: only with SOTC_FG_HUDLESS=1 (vk_rasterizer.cpp): the upscaler alone also has the
+    // frame taken above (hudless_image) and needs no presented copy.
+    static const bool fg_hudless = [] {
+        const char* v = std::getenv("SOTC_FG_HUDLESS");
+        return v && v[0] == '1';
+    }();
+    if (hudless_view && fg_hudless && FrameGen::Current() != FrameGen::Mode::Off &&
+        !DebugState.is_using_fsr) {
         Frame& hudless = hudless_frames[frame->id];
         if (hudless.width != frame->width || hudless.height != frame->height ||
             hudless.is_hdr != frame->is_hdr || !hudless.image) {
@@ -1149,6 +1213,52 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
 
     auto& scheduler = present_scheduler;
     const auto cmdbuf = scheduler.CommandBuffer();
+
+    // sotc: temporal upscaler: the game frame was drawn bilinear at PrepareFrame; this draws it
+    // again from the upscaler's result (a frame without its inputs keeps the bilinear one).
+    if (Fsr3Up::Wanted() && is_game_frame && !is_reusing_frame) {
+        if (const vk::ImageView up =
+                Fsr3Up::Dispatch(cmdbuf, scheduler, frame->id, frame->width, frame->height)) {
+            const vk::ImageSubresourceRange all{vk::ImageAspectFlagBits::eColor, 0, 1, 0,
+                                                VK_REMAINING_ARRAY_LAYERS};
+            const auto to_target = vk::ImageMemoryBarrier2{
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .srcAccessMask =
+                    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+                .oldLayout = vk::ImageLayout::eUndefined,
+                .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+                .image = frame->image,
+                .subresourceRange = all,
+            };
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
+                                                       .pImageMemoryBarriers = &to_target});
+            // sotc: the sharpening setting (F1 / launcher) over the upscaler's output too, as
+            // RCAS after FSR 1 (2mg, fork issue #5: it did nothing with FSR 3.1 and DLSS).
+            HostPasses::FsrPass::Settings sharpen{
+                .use_rcas = EmulatorSettings.IsRcasEnabled(),
+                .rcas_attenuation = static_cast<float>(EmulatorSettings.GetRcasAttenuation()) / 1000.f,
+            };
+            ApplyLiveRcas(sharpen);
+            const vk::ImageView shown = sharpen_pass.Render(cmdbuf, up, {frame->width, frame->height},
+                                                            {frame->width, frame->height}, sharpen,
+                                                            frame->is_hdr);
+            pp_pass.Render(cmdbuf, shown, {frame->width, frame->height}, *frame, pp_settings);
+            const auto to_general = vk::ImageMemoryBarrier2{
+                .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .dstAccessMask = vk::AccessFlagBits2::eMemoryRead,
+                .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
+                .newLayout = vk::ImageLayout::eGeneral,
+                .image = frame->image,
+                .subresourceRange = all,
+            };
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
+                                                       .pImageMemoryBarriers = &to_general});
+        }
+    }
     const u32 capture_with_overlays_count =
         VideoCore::ConsumeWithOverlaysScreenshotRequests() + (TakeSequenceShot() ? 1 : 0);
     std::optional<ScreenshotReadback> pending_screenshot;
