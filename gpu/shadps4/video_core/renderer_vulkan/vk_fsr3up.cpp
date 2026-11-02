@@ -782,15 +782,8 @@ vk::ImageView Dispatch(vk::CommandBuffer cmdbuf, Scheduler& scheduler, u32 frame
     inputs.reactive = reactive;
     inputs.render_size = vk::Extent2D{width, height};
     inputs.output_size = vk::Extent2D{out_width, out_height};
-    // sotc: SOTC_FSR3_JITTER=x|y|xy negates the jitter given to the upscaler (diagnostic: the DLSS
-    // convention is used as is; a wrong sign makes FSR 3.1 reject its history, edges stay stepped).
-    static const std::pair<float, float> jitter_sign = [] {
-        const char* v = std::getenv("SOTC_FSR3_JITTER");
-        const bool x = v && std::strchr(v, 'x'), y = v && std::strchr(v, 'y');
-        return std::pair{x ? -1.0f : 1.0f, y ? -1.0f : 1.0f};
-    }();
-    inputs.jitter_x = in.jitter[0] * jitter_sign.first;
-    inputs.jitter_y = in.jitter[1] * jitter_sign.second;
+    inputs.jitter_x = in.jitter[0];
+    inputs.jitter_y = in.jitter[1];
     // The game's motion vectors are curUV - prevUV; FSR wants prev - cur, in render pixels.
     inputs.mv_scale_x = -static_cast<float>(width);
     inputs.mv_scale_y = -static_cast<float>(height);
