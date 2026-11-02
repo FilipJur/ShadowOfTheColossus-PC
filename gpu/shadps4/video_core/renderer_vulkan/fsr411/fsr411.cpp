@@ -517,7 +517,9 @@ struct Upscaler::Impl {
             !MakeBuffer(initializer, 131072,
                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false) ||
             !MakeBuffer(staging, 131072, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true) ||
-            !MakeBuffer(ubo, kFramesInFlight * 4 * ubo_align, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, true) ||
+            !MakeBuffer(ubo, kFramesInFlight * 4 * ubo_align,
+                        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                        true) ||
             !MakeBuffer(tensor_ubo, 512, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, true)) {
             return false;
         }
@@ -604,7 +606,8 @@ struct Upscaler::Impl {
             vkCmdResetQueryPool(cmd, profile_pool, query_base, kPassCount + 1);
             vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, profile_pool, query_base);
         }
-        auto* base = static_cast<uint8_t*>(ubo.mapped) + slot;
+        // sotc: device-side uploads (vkCmdUpdateBuffer) instead of host memcpy: the slot of
+        // a still-running frame must not be rewritten from the host.
         struct Mlsr {
             float inv_size[2], scale[2], inv_scale[2], jitter[2], mv_scale[2], tex_size[2],
                 max_render_size[2], mv_jitter_cancellation[2];
@@ -635,7 +638,7 @@ struct Upscaler::Impl {
         mlsr.previous_pre_exposure = previous_pre_exposure;
         mlsr.rcas_enabled = f.sharpen ? 1u : 0u;
         mlsr.rcas_sharpness = f.sharpness;
-        std::memcpy(base, &mlsr, sizeof(mlsr));
+        vkCmdUpdateBuffer(cmd, ubo.buffer, slot, sizeof(mlsr), &mlsr);
         struct Spd {
             uint32_t mips, work_groups, offset[2];
             float inv_input_size[2], pre_exposure, pad;
@@ -647,7 +650,7 @@ struct Upscaler::Impl {
         spd.inv_input_size[0] = 1.0f / float(rw);
         spd.inv_input_size[1] = 1.0f / float(rh);
         spd.pre_exposure = pre_exposure;
-        std::memcpy(base + ubo_align, &spd, sizeof(spd));
+        vkCmdUpdateBuffer(cmd, ubo.buffer, slot + ubo_align, sizeof(spd), &spd);
         struct Rcas {
             uint32_t config[4];
             float pre_exposure;
@@ -658,7 +661,12 @@ struct Upscaler::Impl {
         std::memcpy(&rcas.config[0], &linear, 4);
         rcas.config[1] = uint32_t(FloatToHalf(linear)) | (uint32_t(FloatToHalf(linear)) << 16);
         rcas.pre_exposure = pre_exposure;
-        std::memcpy(base + 2 * ubo_align, &rcas, sizeof(rcas));
+        vkCmdUpdateBuffer(cmd, ubo.buffer, slot + 2 * ubo_align, sizeof(rcas), &rcas);
+        VkMemoryBarrier uploaded{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        uploaded.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        uploaded.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             0, 1, &uploaded, 0, nullptr, 0, nullptr);
         previous_pre_exposure = pre_exposure;
 
         const Img& exposure_image = f.auto_exposure ? exposure : exposure_identity;

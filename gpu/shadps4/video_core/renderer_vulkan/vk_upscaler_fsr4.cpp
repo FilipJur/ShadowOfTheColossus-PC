@@ -42,6 +42,7 @@ struct Owned {
     };
     Image color, depth, motion, output;
     u32 render_w = 0, render_h = 0, out_w = 0, out_h = 0;
+    bool ultra_performance = false;
 
     void DestroyImage(Image& img) {
         if (img.view) {
@@ -151,20 +152,51 @@ void Barrier(vk::CommandBuffer cmd, vk::Image image, vk::ImageLayout old_layout,
     });
 }
 
-/// Convert or copy `src` (in `src.layout`) into `dst` (already in General, render size); the
-/// result is General for compute. Both images are owned by this backend; the game's input
-/// attachments are only read.
-void ConvertInto(vk::CommandBuffer cmd, const Resource& src, Owned::Image& dst,
-                 vk::Format dst_format, bool linear) {
+/// Barrier `img` from `old_layout` to General for compute reads.
+void ToGeneral(vk::CommandBuffer cmd, vk::Image image, vk::ImageLayout old_layout,
+               vk::AccessFlags2 src_access, vk::ImageAspectFlags aspect) {
     using namespace vk;
-    if (src.format == dst_format && src.size.width == dst.width && src.size.height == dst.height) {
-        // Same pixels, maybe another layout: a barrier is enough.
-        Barrier(cmd, src.image, src.layout, ImageLayout::eGeneral, PipelineStageFlagBits2::eAllCommands,
-                AccessFlagBits2::eMemoryWrite, PipelineStageFlagBits2::eComputeShader,
-                AccessFlagBits2::eShaderRead, ImageAspectFlagBits::eColor);
-        return;
+    Barrier(cmd, image, old_layout, ImageLayout::eGeneral, PipelineStageFlagBits2::eAllCommands,
+            src_access, PipelineStageFlagBits2::eComputeShader, AccessFlagBits2::eShaderRead,
+            aspect);
+}
+
+/// Copy `src` (in `src_layout`) into `dst` (already in General, same size, colour aspects).
+/// Blit when the formats differ, copy when they match; the result is General for compute.
+bool CopyInto(vk::CommandBuffer cmd, const Instance& instance, const Resource& src,
+              Owned::Image& dst, bool linear, std::string& error) {
+    using namespace vk;
+    if (src.format == dst.format) {
+        Barrier(cmd, src.image, src.layout, ImageLayout::eTransferSrcOptimal,
+                PipelineStageFlagBits2::eAllCommands, AccessFlagBits2::eMemoryWrite,
+                PipelineStageFlagBits2::eBlit, AccessFlagBits2::eTransferRead,
+                ImageAspectFlagBits::eColor);
+        Barrier(cmd, dst.image, ImageLayout::eGeneral, ImageLayout::eTransferDstOptimal,
+                PipelineStageFlagBits2::eComputeShader, AccessFlagBits2::eShaderRead,
+                PipelineStageFlagBits2::eBlit, AccessFlagBits2::eTransferWrite,
+                ImageAspectFlagBits::eColor);
+        const vk::ImageCopy copy{
+            .srcSubresource = {ImageAspectFlagBits::eColor, 0, 0, 1},
+            .srcOffset = {0, 0, 0},
+            .dstSubresource = {ImageAspectFlagBits::eColor, 0, 0, 1},
+            .dstOffset = {0, 0, 0},
+            .extent = {dst.width, dst.height, 1},
+        };
+        cmd.copyImage(src.image, ImageLayout::eTransferSrcOptimal, dst.image,
+                      ImageLayout::eTransferDstOptimal, copy);
+        Barrier(cmd, dst.image, ImageLayout::eTransferDstOptimal, ImageLayout::eGeneral,
+                PipelineStageFlagBits2::eBlit, AccessFlagBits2::eTransferWrite,
+                PipelineStageFlagBits2::eComputeShader, AccessFlagBits2::eShaderRead,
+                ImageAspectFlagBits::eColor);
+        return true;
     }
-    // Different format or size: blit (depth is compared separately below; this is colour).
+    if (!instance.IsFormatSupported(src.format,
+                                    FormatFeatureFlagBits2::eBlitSrc | FormatFeatureFlagBits2::eSampledImage) ||
+        !instance.IsFormatSupported(dst.format, FormatFeatureFlagBits2::eBlitDst |
+                                                    FormatFeatureFlagBits2::eStorageImage)) {
+        error = "colour conversion blit not supported by the device";
+        return false;
+    }
     Barrier(cmd, src.image, src.layout, ImageLayout::eTransferSrcOptimal,
             PipelineStageFlagBits2::eAllCommands, AccessFlagBits2::eMemoryWrite,
             PipelineStageFlagBits2::eBlit, AccessFlagBits2::eTransferRead,
@@ -188,6 +220,7 @@ void ConvertInto(vk::CommandBuffer cmd, const Resource& src, Owned::Image& dst,
             PipelineStageFlagBits2::eBlit, AccessFlagBits2::eTransferWrite,
             PipelineStageFlagBits2::eComputeShader, AccessFlagBits2::eShaderRead,
             ImageAspectFlagBits::eColor);
+    return true;
 }
 
 /// Asset directory: SOTC_FSR4_DIR, else $SOTC_DATA_DIR/fsr4_411, else two levels above the
@@ -229,6 +262,7 @@ private:
     std::unique_ptr<Fsr411::Upscaler> upscaler;
     std::string problem; // last Dispatch failure, for the one stderr line
     Owned owned;
+    bool recorded_once = false;
 
     bool CheckDevice(const char* what, std::string& error);
 };
@@ -258,6 +292,34 @@ bool Fsr4Backend::Init(const Instance& inst) {
                      dir.c_str());
         return false;
     }
+    // No fallback to official FSR 4.1.1: every required set must be present, or Init
+    // fails and Active() falls back to Fsr3Builtin.
+    static constexpr const char* kPasses[] = {
+        "spd",         "prepass",     "pass0_post",  "pass1",       "pass1_post",  "pass2",
+        "pass2_post",  "pass3",       "pass3_post",  "pass4",       "pass4_post",  "pass5",
+        "pass5_post",  "pass6",       "pass6_post",  "pass7",       "pass7_post",  "pass8",
+        "pass8_post",  "pass9",       "pass9_post",  "pass10",      "pass10_post", "pass11",
+        "pass11_post", "pass12",      "pass12_post", "postpass",    "rcas",
+    }; // keep in sync with kPasses in fsr411/fsr411.cpp
+    for (const char* set : {"t1080_m0", "t1080_m1", "t2160_m0", "t2160_m1"}) {
+        for (const char* pass : kPasses) {
+            std::error_code ec2;
+            if (!std::filesystem::is_regular_file(std::filesystem::path(dir) / set /
+                                                      (std::string(pass) + ".spv"),
+                                                  ec2)) {
+                std::fprintf(stderr, "SOTC upscaler: fsr4 unavailable: missing %s/%s/%s.spv\n",
+                             dir.c_str(), set, pass);
+                return false;
+            }
+        }
+        std::error_code ec3;
+        if (!std::filesystem::is_regular_file(std::filesystem::path(dir) / set / "initializer.bin",
+                                              ec3)) {
+            std::fprintf(stderr, "SOTC upscaler: fsr4 unavailable: missing %s/%s/initializer.bin\n",
+                         dir.c_str(), set);
+            return false;
+        }
+    }
     upscaler = std::make_unique<Fsr411::Upscaler>(
         static_cast<VkPhysicalDevice>(inst.GetPhysicalDevice()),
         static_cast<VkDevice>(inst.GetDevice()), dir);
@@ -285,25 +347,21 @@ bool Fsr4Backend::Dispatch(vk::CommandBuffer cmdbuf, const Inputs& in, const Res
     }
     const vk::Device device = instance->GetDevice();
     const vk::PhysicalDevice physical = instance->GetPhysicalDevice();
-    // The replay owns its intermediates (created on size change); idle the device so that no
-    // frame still reads them. In-flight frames only ever touch the fsr411 object itself.
-    if ((rw != owned.render_w || rh != owned.render_h || ow != owned.out_w ||
-         oh != owned.out_h) &&
-        (owned.color.image || owned.depth.image)) {
+    // The replay's constant uploads are device-side (vkCmdUpdateBuffer), but its images,
+    // pipelines and tensor sizes are recreated when the set or sizes change: the oldest
+    // frame must be done first.
+    const bool ultra_performance = float(ow) / float(rw) > 2.5f;
+    if (!recorded_once || rw != owned.render_w || rh != owned.render_h || ow != owned.out_w ||
+        oh != owned.out_h || ultra_performance != owned.ultra_performance) {
         (void)device.waitIdle();
-        owned.device_idle = true;
         owned.Destroy();
         owned.device = device;
         owned.device_idle = true;
+        recorded_once = true;
     }
     auto ensure = [&](Owned::Image& img, vk::Format format, u32 w, u32 h, const char* what) {
-        if (img.image && img.width == w && img.height == h && img.format == format) {
-            return true;
-        }
         if (img.image) {
-            (void)device.waitIdle();
-            owned.device_idle = true;
-            owned.DestroyImage(img);
+            return true; // created together after the wait above; sizes match by construction
         }
         if (!MakeImage(physical, device, img, format, w, h, error)) {
             std::fprintf(stderr, "SOTC upscaler: fsr4 unavailable: %s %s\n", what, error.c_str());
@@ -312,16 +370,23 @@ bool Fsr4Backend::Dispatch(vk::CommandBuffer cmdbuf, const Inputs& in, const Res
         return true;
     };
     // Same formats the old game driver fed the replay: RGBA16F colour, D32 depth, RG16F
-    // motion, RGBA16F output.
-    if (!ensure(owned.color, vk::Format::eR16G16B16A16Sfloat, rw, rh, "colour")) {
+    // motion, RGBA16F output. Matching caller images are used in place (a barrier to
+    // General is enough); the rest is copied into owned intermediates.
+    const bool color_direct = in.color.format == vk::Format::eR16G16B16A16Sfloat &&
+                              in.color.size.width == rw && in.color.size.height == rh;
+    const bool depth_direct = in.depth.size.width == rw && in.depth.size.height == rh;
+    const bool motion_direct = in.motion_vectors.format == vk::Format::eR16G16Sfloat &&
+                               in.motion_vectors.size.width == rw &&
+                               in.motion_vectors.size.height == rh;
+    const bool output_direct = output.format == vk::Format::eR16G16B16A16Sfloat &&
+                               output.size.width == ow && output.size.height == oh;
+    if (!color_direct && !ensure(owned.color, vk::Format::eR16G16B16A16Sfloat, rw, rh, "colour")) {
         return false;
     }
-    if (!ensure(owned.depth, vk::Format::eD32Sfloat, rw, rh, "depth")) {
+    if (!motion_direct && !ensure(owned.motion, vk::Format::eR16G16Sfloat, rw, rh, "motion")) {
         return false;
     }
-    if (!ensure(owned.motion, vk::Format::eR16G16Sfloat, rw, rh, "motion")) {
-        return false;
-    }
+    // The replay writes its output image; only an owned image may be handed to it.
     if (!ensure(owned.output, vk::Format::eR16G16B16A16Sfloat, ow, oh, "output")) {
         return false;
     }
@@ -329,67 +394,66 @@ bool Fsr4Backend::Dispatch(vk::CommandBuffer cmdbuf, const Inputs& in, const Res
     owned.render_h = rh;
     owned.out_w = ow;
     owned.out_h = oh;
+    owned.ultra_performance = ultra_performance;
     owned.device_idle = false;
 
-    // Convert or copy the inputs into the replay's formats (each becomes General). Depth is
-    // compared by format, not aspect: the game may hand it in a depth layout.
-    ConvertInto(cmdbuf, in.color, owned.color, vk::Format::eR16G16B16A16Sfloat, true);
-    {
-        using namespace vk;
-        if (in.depth.format == Format::eD32Sfloat && in.depth.size.width == rw &&
-            in.depth.size.height == rh) {
-            Barrier(cmdbuf, in.depth.image, in.depth.layout, ImageLayout::eGeneral,
-                    PipelineStageFlagBits2::eAllCommands, AccessFlagBits2::eMemoryWrite,
-                    PipelineStageFlagBits2::eComputeShader, AccessFlagBits2::eShaderRead,
-                    ImageAspectFlagBits::eDepth);
-        } else {
-            // Non-D32 depth: copy through a blit into the owned D32 image.
-            Barrier(cmdbuf, in.depth.image, in.depth.layout, ImageLayout::eTransferSrcOptimal,
-                    PipelineStageFlagBits2::eAllCommands, AccessFlagBits2::eMemoryWrite,
-                    PipelineStageFlagBits2::eBlit, AccessFlagBits2::eTransferRead,
-                    ImageAspectFlagBits::eDepth);
-            Barrier(cmdbuf, owned.depth.image, ImageLayout::eUndefined,
-                    ImageLayout::eTransferDstOptimal, PipelineStageFlagBits2::eComputeShader,
-                    AccessFlagBits2::eNone, PipelineStageFlagBits2::eBlit,
-                    AccessFlagBits2::eTransferWrite, ImageAspectFlagBits::eDepth);
-            const vk::ImageBlit blit{
-                .srcSubresource = {ImageAspectFlagBits::eDepth, 0, 0, 1},
-                .srcOffsets = std::array{vk::Offset3D{0, 0, 0},
-                                         vk::Offset3D{static_cast<s32>(in.depth.size.width),
-                                                      static_cast<s32>(in.depth.size.height), 1}},
-                .dstSubresource = {ImageAspectFlagBits::eDepth, 0, 0, 1},
-                .dstOffsets = std::array{vk::Offset3D{0, 0, 0},
-                                         vk::Offset3D{static_cast<s32>(rw), static_cast<s32>(rh), 1}},
-            };
-            cmdbuf.blitImage(in.depth.image, ImageLayout::eTransferSrcOptimal, owned.depth.image,
-                             ImageLayout::eTransferDstOptimal, blit, Filter::eNearest);
-            Barrier(cmdbuf, owned.depth.image, ImageLayout::eTransferDstOptimal,
-                    ImageLayout::eGeneral, PipelineStageFlagBits2::eBlit,
-                    AccessFlagBits2::eTransferWrite, PipelineStageFlagBits2::eComputeShader,
-                    AccessFlagBits2::eShaderRead, ImageAspectFlagBits::eDepth);
+    if (color_direct) {
+        ToGeneral(cmdbuf, in.color.image, in.color.layout, vk::AccessFlagBits2::eMemoryWrite,
+                  vk::ImageAspectFlagBits::eColor);
+    } else if (!CopyInto(cmdbuf, *instance, in.color, owned.color, true, error)) {
+        if (!error.empty() && problem != error) {
+            problem = error;
+            std::fprintf(stderr, "SOTC upscaler: fsr4 unavailable: %s\n", error.c_str());
         }
+        return false;
     }
-    ConvertInto(cmdbuf, in.motion_vectors, owned.motion, vk::Format::eR16G16Sfloat, false);
+    // Depth passes straight through with the caller's depth-aspect view (as the old game
+    // driver did); a depth blit would be invalid usage (depth formats must match).
+    if (!depth_direct) {
+        error = "depth must be the render size";
+        if (problem != error) {
+            problem = error;
+            std::fprintf(stderr, "SOTC upscaler: fsr4 unavailable: %s\n", error.c_str());
+        }
+        return false;
+    }
+    ToGeneral(cmdbuf, in.depth.image, in.depth.layout, vk::AccessFlagBits2::eMemoryWrite,
+              vk::ImageAspectFlagBits::eDepth);
+    if (motion_direct) {
+        ToGeneral(cmdbuf, in.motion_vectors.image, in.motion_vectors.layout,
+                  vk::AccessFlagBits2::eMemoryWrite, vk::ImageAspectFlagBits::eColor);
+    } else if (!CopyInto(cmdbuf, *instance, in.motion_vectors, owned.motion, false, error)) {
+        if (!error.empty() && problem != error) {
+            problem = error;
+            std::fprintf(stderr, "SOTC upscaler: fsr4 unavailable: %s\n", error.c_str());
+        }
+        return false;
+    }
 
+    const vk::Image frame_color = color_direct ? in.color.image : owned.color.image;
+    const vk::ImageView frame_color_view = color_direct ? in.color.view : owned.color.view;
+    const vk::Image frame_motion = motion_direct ? in.motion_vectors.image : owned.motion.image;
+    const vk::ImageView frame_motion_view = motion_direct ? in.motion_vectors.view : owned.motion.view;
     Fsr411::Frame frame{};
     frame.cmdbuf = static_cast<VkCommandBuffer>(cmdbuf);
-    frame.color = {static_cast<VkImage>(owned.color.image), static_cast<VkImageView>(owned.color.view),
+    frame.color = {static_cast<VkImage>(frame_color), static_cast<VkImageView>(frame_color_view),
                    rw, rh};
-    frame.depth = {static_cast<VkImage>(owned.depth.image), static_cast<VkImageView>(owned.depth.view),
+    frame.depth = {static_cast<VkImage>(in.depth.image), static_cast<VkImageView>(in.depth.view),
                    rw, rh};
-    frame.motion = {static_cast<VkImage>(owned.motion.image),
-                    static_cast<VkImageView>(owned.motion.view), rw, rh};
+    frame.motion = {static_cast<VkImage>(frame_motion),
+                    static_cast<VkImageView>(frame_motion_view), rw, rh};
     frame.output = {static_cast<VkImage>(owned.output.image),
                     static_cast<VkImageView>(owned.output.view), ow, oh};
     frame.render_width = rw;
     frame.render_height = rh;
     // Two models, chosen by ratio as the old game driver did: 3.0 (ultra performance) or not.
-    frame.ultra_performance = float(ow) / float(rw) > 2.5f;
+    frame.ultra_performance = ultra_performance;
     frame.jitter[0] = in.jitter_x;
     frame.jitter[1] = in.jitter_y;
-    // Vectors are in render pixels; the replay divides by the render size.
-    frame.motion_scale[0] = in.mv_scale_x;
-    frame.motion_scale[1] = in.mv_scale_y;
+    // Vectors are in render pixels; the replay divides by the render size. A zero scale is
+    // an unset field, not disabled motion: the old driver always passed 1.
+    frame.motion_scale[0] = in.mv_scale_x != 0.0f ? in.mv_scale_x : 1.0f;
+    frame.motion_scale[1] = in.mv_scale_y != 0.0f ? in.mv_scale_y : 1.0f;
     frame.pre_exposure = in.pre_exposure > 0.0f ? in.pre_exposure : 1.0f;
     frame.sharpness = std::clamp(in.sharpness, 0.0f, 1.0f);
     frame.sharpen = in.sharpness >= 0.0f;
@@ -405,8 +469,8 @@ bool Fsr4Backend::Dispatch(vk::CommandBuffer cmdbuf, const Inputs& in, const Res
     }
     problem.clear();
 
-    // To the caller's output in ShaderReadOnlyOptimal. The replay's output is always exactly
-    // the output size, so this is a same-size blit.
+    // To the caller's output in ShaderReadOnlyOptimal: same-size blit from the owned image
+    // the replay wrote.
     using namespace vk;
     Barrier(cmdbuf, owned.output.image, ImageLayout::eGeneral, ImageLayout::eTransferSrcOptimal,
             PipelineStageFlagBits2::eComputeShader, AccessFlagBits2::eShaderWrite,

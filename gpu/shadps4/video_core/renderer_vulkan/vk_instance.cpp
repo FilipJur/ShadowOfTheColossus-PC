@@ -609,6 +609,7 @@ bool Instance::CreateDevice() {
             .subgroupSizeControl = vk13_features.subgroupSizeControl,
             .synchronization2 = vk13_features.synchronization2,
             .dynamicRendering = vk13_features.dynamicRendering,
+            .shaderIntegerDotProduct = vk13_features.shaderIntegerDotProduct,
             .maintenance4 = vk13_features.maintenance4,
         },
         // Extensions
