@@ -19,6 +19,7 @@
 #include "video_core/renderer_vulkan/vk_upscaler.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/sotc_stats.h"
+
 #include <vk_mem_alloc.h>
 
 namespace Vulkan {
