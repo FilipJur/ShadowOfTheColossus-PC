@@ -504,6 +504,16 @@ void NoDepth(u32 frame_id) {
     }
 }
 
+bool DepthImage(u32 frame_id, vk::Image& image, u32& width, u32& height) {
+    if (frame_id >= kMaxFrames || !depth_slots[frame_id].valid) {
+        return false;
+    }
+    image = depth_slots[frame_id].r32.image;
+    width = depth_slots[frame_id].r32.width;
+    height = depth_slots[frame_id].r32.height;
+    return true;
+}
+
 void NoteGameFrame() {
     const auto now = Clock::now();
     if (frame_arrival.time_since_epoch().count() != 0) {

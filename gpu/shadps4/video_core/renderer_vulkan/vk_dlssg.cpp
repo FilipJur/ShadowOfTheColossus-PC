@@ -36,7 +36,9 @@
 #include "video_core/amdgpu/regs.h"
 #include "video_core/host_shaders/dlss_color_sanitize_comp.h"
 #include "video_core/host_shaders/dlss_mvec_fill_comp.h"
+#include "video_core/renderer_vulkan/vk_fsr3up.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_upscaler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -791,8 +793,12 @@ bool Parallel() {
     return parallel;
 }
 
-/// Inputs are captured while DLSS-G or FSR 3 is the frame generation mode.
+/// Inputs are captured while DLSS-G or FSR 3 is the frame generation mode, or the temporal
+/// upscaler (built-in FSR 3.1, FFX API, FSR 4) needs the same depth and motion vectors.
 bool Capturing() {
+    if (Fsr3Up::Wanted()) {
+        return g_instance != nullptr;
+    }
     switch (FrameGen::Current()) {
     case FrameGen::Mode::Dlss:
         return supported;
@@ -1904,7 +1910,7 @@ void PrepareInputs(u32 frame_id, vk::CommandBuffer cmdbuf, VideoCore::TextureCac
     f.sl_valid = false;
     f.hudless = {};
     FsrFg::NoDepth(frame_id);
-    const bool fsr = FrameGen::Current() == FrameGen::Mode::Fsr;
+    const bool fsr = FrameGen::Current() == FrameGen::Mode::Fsr || Fsr3Up::Wanted();
     if (!supported && !fsr && !sr_supported) {
         pending = Pending{};
         return;
@@ -2190,6 +2196,7 @@ bool GetFrameInputs(u32 frame_id, FrameInputs& out) {
     const FrameSlot& f = frames[frame_id];
     const sl::Constants& c = f.constants;
     out.mvec = f.mvec;
+    out.mvec_view = f.mvec_view;
     out.mvec_usage = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eTransferSrc |
                      vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eStorage;
     out.width = f.width;
