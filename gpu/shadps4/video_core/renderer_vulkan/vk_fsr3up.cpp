@@ -533,6 +533,52 @@ void Init(const Instance& instance) {
     }
 }
 
+void Shutdown() {
+    if (!g_instance) {
+        return; // Init never ran (or already shut down)
+    }
+    for (auto& img : colors) {
+        DestroyImage(img);
+    }
+    for (auto& img : hudless_colors) {
+        DestroyImage(img);
+    }
+    for (auto& img : outputs) {
+        DestroyImage(img);
+    }
+    DestroyImage(reactive_img);
+    for (auto& h : history) {
+        DestroyImage(h);
+    }
+    color_ready = {};
+    hudless_ready = {};
+    color_swapped = {};
+    history_valid = false;
+    history_index = 0;
+    if (hud_shader) {
+        g_instance->GetDevice().destroyShaderModule(hud_shader);
+        hud_shader = {};
+    }
+    hud_pipeline.reset();
+    hud_layout.reset();
+    hud_set_layout.reset();
+    hud_sampler.reset();
+    hud_failed = false;
+    if (reactive_shader) {
+        g_instance->GetDevice().destroyShaderModule(reactive_shader);
+        reactive_shader = {};
+    }
+    reactive_pipeline.reset();
+    reactive_layout.reset();
+    reactive_set_layout.reset();
+    reactive_sampler.reset();
+    reactive_failed = false;
+    failed = false;
+    last_time = {};
+    interval_ms = 16.6f;
+    g_instance = nullptr;
+}
+
 bool Wanted() {
     return AskedAtStart() && Upscaler::Active() != nullptr && !failed;
 }

@@ -15,6 +15,7 @@
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_dlssg.h"
+#include "video_core/renderer_vulkan/vk_fsr3up.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_upscaler.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
@@ -807,6 +808,7 @@ bool Instance::CreateDevice() {
 
     CreateAllocator();
     Upscaler::OnDeviceCreated(*this); // sotc: temporal upscaler backend (SOTC_UPSCALER)
+    Fsr3Up::Init(*this);              // sotc: temporal upscaler frontend (inputs, HUD split, stats)
     Dlssg::OnDeviceCreated(*this); // sotc: DLSS Frame Generation (SOTC_DLSSG=1)
     return true;
 }
