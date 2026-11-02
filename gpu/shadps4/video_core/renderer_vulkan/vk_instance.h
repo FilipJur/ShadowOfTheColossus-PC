@@ -348,6 +348,14 @@ public:
         return features.tessellationShader;
     }
 
+    /// sotc: true when the FSR 4.1.1 INT8 model passes can run (Float16, Int8, Int16, packed
+    /// int8 dot products, and the VALVE mixed float dot product extension, added to the device
+    /// chain with the old vk_fsr4.cpp feature set).
+    bool IsFsr411Supported() const {
+        return vk12_features.shaderFloat16 && vk12_features.shaderInt8 && features.shaderInt16 &&
+               vk13_features.shaderIntegerDotProduct && mixed_float_dot_product;
+    }
+
     /// Returns true when the shaderSubgroupClock feature of
     /// VK_KHR_shader_clock is supported.
     bool IsShaderSubgroupClockSupported() const {
@@ -655,6 +663,7 @@ private:
     bool image_2d_view_of_3d{};
     bool image_view_min_lod{};
     bool shader_clock{};
+    bool mixed_float_dot_product{}; // sotc: VK_VALVE_shader_mixed_float_dot_product (FSR 4.1.1)
     bool supports_memory_budget{};
     bool device_fault{};
     bool device_fault_vendor_binary{};
