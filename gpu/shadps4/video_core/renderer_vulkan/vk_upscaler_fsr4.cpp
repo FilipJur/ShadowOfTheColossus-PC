@@ -263,6 +263,7 @@ private:
     std::string problem; // last Dispatch failure, for the one stderr line
     Owned owned;
     bool recorded_once = false;
+    bool output_first_use = true; // owned.output still Undefined: the replay wrote it as General
 
     bool CheckDevice(const char* what, std::string& error);
 };
@@ -358,6 +359,7 @@ bool Fsr4Backend::Dispatch(vk::CommandBuffer cmdbuf, const Inputs& in, const Res
         owned.device = device;
         owned.device_idle = true;
         recorded_once = true;
+        output_first_use = true; // a fresh image: Undefined, not the last blit's TransferSrc
     }
     auto ensure = [&](Owned::Image& img, vk::Format format, u32 w, u32 h, const char* what) {
         if (img.image) {
@@ -470,12 +472,15 @@ bool Fsr4Backend::Dispatch(vk::CommandBuffer cmdbuf, const Inputs& in, const Res
     problem.clear();
 
     // To the caller's output in ShaderReadOnlyOptimal: same-size blit from the owned image
-    // the replay wrote.
+    // the replay wrote. The owned image is a replay frame image (GENERAL there); the first
+    // dispatch after creation transitions it out of Undefined, afterwards out of the
+    // TransferSrcOptimal the previous blit left it in.
     using namespace vk;
-    Barrier(cmdbuf, owned.output.image, ImageLayout::eGeneral, ImageLayout::eTransferSrcOptimal,
-            PipelineStageFlagBits2::eComputeShader, AccessFlagBits2::eShaderWrite,
-            PipelineStageFlagBits2::eBlit, AccessFlagBits2::eTransferRead,
-            ImageAspectFlagBits::eColor);
+    Barrier(cmdbuf, owned.output.image,
+            output_first_use ? ImageLayout::eUndefined : ImageLayout::eGeneral,
+            ImageLayout::eTransferSrcOptimal, PipelineStageFlagBits2::eAllCommands,
+            AccessFlagBits2::eNone, PipelineStageFlagBits2::eBlit,
+            AccessFlagBits2::eTransferRead, ImageAspectFlagBits::eColor);
     Barrier(cmdbuf, output.image, output.layout, ImageLayout::eTransferDstOptimal,
             PipelineStageFlagBits2::eAllCommands, AccessFlagBits2::eMemoryWrite,
             PipelineStageFlagBits2::eBlit, AccessFlagBits2::eTransferWrite,
@@ -490,12 +495,18 @@ bool Fsr4Backend::Dispatch(vk::CommandBuffer cmdbuf, const Inputs& in, const Res
     };
     cmdbuf.blitImage(owned.output.image, ImageLayout::eTransferSrcOptimal, output.image,
                      ImageLayout::eTransferDstOptimal, blit, Filter::eNearest);
+    Barrier(cmdbuf, owned.output.image, ImageLayout::eTransferSrcOptimal, ImageLayout::eGeneral,
+            PipelineStageFlagBits2::eBlit, AccessFlagBits2::eTransferRead,
+            PipelineStageFlagBits2::eComputeShader,
+            AccessFlagBits2::eShaderRead | AccessFlagBits2::eShaderWrite,
+            ImageAspectFlagBits::eColor);
     Barrier(cmdbuf, output.image, ImageLayout::eTransferDstOptimal,
             ImageLayout::eShaderReadOnlyOptimal, PipelineStageFlagBits2::eBlit,
             AccessFlagBits2::eTransferWrite, PipelineStageFlagBits2::eFragmentShader,
             AccessFlagBits2::eShaderRead, ImageAspectFlagBits::eColor);
     // The replay's images stay in use by this frame; the caller owns the command buffer's
     // lifetime (its own in-flight frames), as with the old constant ring.
+    output_first_use = false;
     return true;
 }
 
