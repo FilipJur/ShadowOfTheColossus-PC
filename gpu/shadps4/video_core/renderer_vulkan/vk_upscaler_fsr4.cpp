@@ -263,7 +263,8 @@ private:
     std::string problem; // last Dispatch failure, for the one stderr line
     Owned owned;
     bool recorded_once = false;
-
+    bool output_first_use = true; // owned.output still Undefined: the replay wrote it as General
+    bool reset_pending = true;    // fresh replay (Init never dispatched): ignore history next time
     bool CheckDevice(const char* what, std::string& error);
 };
 
@@ -358,6 +359,8 @@ bool Fsr4Backend::Dispatch(vk::CommandBuffer cmdbuf, const Inputs& in, const Res
         owned.device = device;
         owned.device_idle = true;
         recorded_once = true;
+        output_first_use = true; // a fresh image: Undefined, not the last blit's TransferSrc
+        reset_pending = true;    // fresh replay history: ignore it on the next dispatch
     }
     auto ensure = [&](Owned::Image& img, vk::Format format, u32 w, u32 h, const char* what) {
         if (img.image) {
@@ -386,9 +389,19 @@ bool Fsr4Backend::Dispatch(vk::CommandBuffer cmdbuf, const Inputs& in, const Res
     if (!motion_direct && !ensure(owned.motion, vk::Format::eR16G16Sfloat, rw, rh, "motion")) {
         return false;
     }
-    // The replay writes its output image; only an owned image may be handed to it.
+    // The replay writes its output image; only an owned image may be handed to it. The
+    // replay keeps frame images in GENERAL, so a fresh image transitions out of Undefined
+    // here, before Record writes it.
     if (!ensure(owned.output, vk::Format::eR16G16B16A16Sfloat, ow, oh, "output")) {
         return false;
+    }
+    if (output_first_use) {
+        Barrier(cmdbuf, owned.output.image, vk::ImageLayout::eUndefined,
+                vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eAllCommands,
+                vk::AccessFlagBits2::eNone, vk::PipelineStageFlagBits2::eComputeShader,
+                vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+                vk::ImageAspectFlagBits::eColor);
+        output_first_use = false;
     }
     owned.render_w = rw;
     owned.render_h = rh;
@@ -457,7 +470,10 @@ bool Fsr4Backend::Dispatch(vk::CommandBuffer cmdbuf, const Inputs& in, const Res
     frame.pre_exposure = in.pre_exposure > 0.0f ? in.pre_exposure : 1.0f;
     frame.sharpness = std::clamp(in.sharpness, 0.0f, 1.0f);
     frame.sharpen = in.sharpness >= 0.0f;
-    frame.reset = in.reset;
+    // sotc: a re-created replay (startup, resize, tier switch) has no history: the first
+    // dispatch after it resets like a camera cut.
+    frame.reset = in.reset || reset_pending;
+    reset_pending = false;
     frame.auto_exposure = !in.exposure.image;
     if (!upscaler->Record(frame)) {
         const std::string err = upscaler->Error();
@@ -470,7 +486,7 @@ bool Fsr4Backend::Dispatch(vk::CommandBuffer cmdbuf, const Inputs& in, const Res
     problem.clear();
 
     // To the caller's output in ShaderReadOnlyOptimal: same-size blit from the owned image
-    // the replay wrote.
+    // the replay wrote (GENERAL: restored right after, so the next replay's write is valid).
     using namespace vk;
     Barrier(cmdbuf, owned.output.image, ImageLayout::eGeneral, ImageLayout::eTransferSrcOptimal,
             PipelineStageFlagBits2::eComputeShader, AccessFlagBits2::eShaderWrite,
@@ -490,6 +506,11 @@ bool Fsr4Backend::Dispatch(vk::CommandBuffer cmdbuf, const Inputs& in, const Res
     };
     cmdbuf.blitImage(owned.output.image, ImageLayout::eTransferSrcOptimal, output.image,
                      ImageLayout::eTransferDstOptimal, blit, Filter::eNearest);
+    Barrier(cmdbuf, owned.output.image, ImageLayout::eTransferSrcOptimal, ImageLayout::eGeneral,
+            PipelineStageFlagBits2::eBlit, AccessFlagBits2::eTransferRead,
+            PipelineStageFlagBits2::eComputeShader,
+            AccessFlagBits2::eShaderRead | AccessFlagBits2::eShaderWrite,
+            ImageAspectFlagBits::eColor);
     Barrier(cmdbuf, output.image, ImageLayout::eTransferDstOptimal,
             ImageLayout::eShaderReadOnlyOptimal, PipelineStageFlagBits2::eBlit,
             AccessFlagBits2::eTransferWrite, PipelineStageFlagBits2::eFragmentShader,

@@ -34,8 +34,9 @@ void ConvertDepth(u32 frame_id, vk::CommandBuffer cmdbuf, vk::ImageView depth_vi
 void NoDepth(u32 frame_id);
 
 /// sotc: the converted depth (R32F, layout General) of presentation frame `frame_id` for the
-/// temporal upscaler frontend (vk_fsr3up.h); false when it has none.
-bool DepthImage(u32 frame_id, vk::Image& image, u32& width, u32& height);
+/// temporal upscaler frontend (vk_fsr3up.h); false when it has none. The view is the colour-aspect
+/// view of the R32F image, for FSR 4.1.1's sampled `r_depth` binding.
+bool DepthImage(u32 frame_id, vk::Image& image, vk::ImageView& view, u32& width, u32& height);
 
 /// Present thread, at a game frame: the time since the last one, for the pacing.
 void NoteGameFrame();

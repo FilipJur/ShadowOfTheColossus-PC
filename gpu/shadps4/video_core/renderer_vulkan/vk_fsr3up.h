@@ -20,6 +20,10 @@ namespace Vulkan::Fsr3Up {
 /// After the device is created.
 void Init(const Instance& instance);
 
+/// Device-idle teardown (Presenter destruction): frees the frontend's images and pipelines.
+/// Safe when Init never ran.
+void Shutdown();
+
 /// The upscaler was asked for (SOTC_UPSCALER=fsr3) and works on this device; the game's inputs are
 /// then captured (Dlssg::CapturingInputs).
 bool Wanted();

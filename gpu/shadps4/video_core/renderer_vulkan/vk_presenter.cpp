@@ -19,6 +19,7 @@
 #include "video_core/renderer_vulkan/vk_fsr3up.h"
 #include "video_core/renderer_vulkan/vk_framegen.h"
 #include "video_core/renderer_vulkan/vk_fsrfg.h"
+#include "video_core/renderer_vulkan/vk_upscaler.h"
 #include "video_core/sotc_fps_cap.h"
 #include "video_core/sotc_stats.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
@@ -580,6 +581,12 @@ Presenter::~Presenter() {
     Check(flip_scheduler.CommandBuffer().reset());
 
     const vk::Device device = instance.GetDevice();
+
+    // sotc: the temporal upscaler owns device images and pipelines; free them here, while the
+    // Instance (device, allocator) is still alive.
+    (void)device.waitIdle();
+    Fsr3Up::Shutdown();
+    Upscaler::Shutdown();
     for (auto& frame : present_frames) {
         vmaDestroyImage(instance.GetAllocator(), frame.image, frame.allocation);
         device.destroyImageView(frame.image_view);

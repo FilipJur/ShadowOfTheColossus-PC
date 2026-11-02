@@ -533,6 +533,52 @@ void Init(const Instance& instance) {
     }
 }
 
+void Shutdown() {
+    if (!g_instance) {
+        return; // Init never ran (or already shut down)
+    }
+    for (auto& img : colors) {
+        DestroyImage(img);
+    }
+    for (auto& img : hudless_colors) {
+        DestroyImage(img);
+    }
+    for (auto& img : outputs) {
+        DestroyImage(img);
+    }
+    DestroyImage(reactive_img);
+    for (auto& h : history) {
+        DestroyImage(h);
+    }
+    color_ready = {};
+    hudless_ready = {};
+    color_swapped = {};
+    history_valid = false;
+    history_index = 0;
+    if (hud_shader) {
+        g_instance->GetDevice().destroyShaderModule(hud_shader);
+        hud_shader = vk::ShaderModule{};
+    }
+    hud_pipeline.reset();
+    hud_layout.reset();
+    hud_set_layout.reset();
+    hud_sampler.reset();
+    hud_failed = false;
+    if (reactive_shader) {
+        g_instance->GetDevice().destroyShaderModule(reactive_shader);
+        reactive_shader = vk::ShaderModule{};
+    }
+    reactive_pipeline.reset();
+    reactive_layout.reset();
+    reactive_set_layout.reset();
+    reactive_sampler.reset();
+    reactive_failed = false;
+    failed = false;
+    last_time = {};
+    interval_ms = 16.6f;
+    g_instance = nullptr;
+}
+
 bool Wanted() {
     return AskedAtStart() && Upscaler::Active() != nullptr && !failed;
 }
@@ -697,8 +743,10 @@ vk::ImageView Dispatch(vk::CommandBuffer cmdbuf, Scheduler& scheduler, u32 frame
     const u32 width = color.width, height = color.height;
     Dlssg::FrameInputs in{};
     vk::Image depth;
+    vk::ImageView depth_view;
     u32 depth_w = 0, depth_h = 0;
-    if (!Dlssg::GetFrameInputs(frame_id, in) || !FsrFg::DepthImage(frame_id, depth, depth_w, depth_h)) {
+    if (!Dlssg::GetFrameInputs(frame_id, in) ||
+        !FsrFg::DepthImage(frame_id, depth, depth_view, depth_w, depth_h)) {
         CountFrame(SkipInputs);
         return {};
     }
@@ -737,10 +785,11 @@ vk::ImageView Dispatch(vk::CommandBuffer cmdbuf, Scheduler& scheduler, u32 frame
         vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_general});
 
     // The reactive mask from this colour and the motion vectors (General for the backend here,
-    // ShaderReadOnlyOptimal once recorded).
+    // ShaderReadOnlyOptimal once recorded). Fsr4 computes reactivity inside its replay.
     Upscaler::Resource reactive{};
     bool show_reactive = false;
-    if (in.mvec_view && EnsureReactive(width, height)) {
+    if (in.mvec_view && backend->GetKind() != Upscaler::Kind::Fsr4 &&
+        EnsureReactive(width, height)) {
         RecordReactive(cmdbuf, color, in.mvec_view, reset);
         reactive = {
             .image = reactive_img.image,
@@ -767,7 +816,7 @@ vk::ImageView Dispatch(vk::CommandBuffer cmdbuf, Scheduler& scheduler, u32 frame
     };
     inputs.depth = {
         .image = depth,
-        .view = {},
+        .view = depth_view,
         .format = vk::Format::eR32Sfloat,
         .size = vk::Extent2D{depth_w, depth_h},
         .layout = vk::ImageLayout::eGeneral,

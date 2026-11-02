@@ -321,7 +321,10 @@ public:
         desc.sharpness = std::clamp(in.sharpness, 0.f, 1.f);
         desc.frameTimeDelta = in.frame_time_ms;
         desc.preExposure = in.pre_exposure != 0.f ? in.pre_exposure : 1.f;
-        desc.reset = in.reset;
+        // sotc: a re-created context (size/flag change) has no history: the first dispatch
+        // after it resets like a camera cut.
+        desc.reset = in.reset || reset_pending_;
+        reset_pending_ = false;
         desc.cameraNear = in.camera_near;
         desc.cameraFar = in.camera_far;
         desc.cameraFovAngleVertical = in.camera_fov_y;
@@ -394,6 +397,15 @@ private:
             return true;
         }
         if (context_) {
+            // sotc: dispatches are recorded on the present thread's command buffers, up to
+            // max(swapchain images, 4) still in flight: wait before freeing the provider's
+            // resources under a running dispatch. No Instance here: the device function
+            // through the backend desc's proc addr.
+            auto wait_idle = reinterpret_cast<PFN_vkDeviceWaitIdle>(
+                backend_.vkDeviceProcAddr(backend_.vkDevice, "vkDeviceWaitIdle"));
+            if (wait_idle) {
+                (void)wait_idle(static_cast<VkDevice>(backend_.vkDevice));
+            }
             api_.destroy(&context_, nullptr);
             context_ = nullptr;
         }
@@ -412,6 +424,7 @@ private:
             context_ = nullptr;
             return false;
         }
+        reset_pending_ = true; // fresh provider history: ignore it on the next dispatch
         return true;
     }
 
@@ -437,6 +450,7 @@ private:
     vk::Extent2D render_size_{}, output_size_{};
     uint32_t flags_{};
     bool inited_{};
+    bool reset_pending_ = true; // fresh context (Init never dispatched): ignore history next time
 };
 
 } // namespace
