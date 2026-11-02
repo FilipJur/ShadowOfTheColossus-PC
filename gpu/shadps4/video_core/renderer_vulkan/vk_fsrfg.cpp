@@ -504,11 +504,12 @@ void NoDepth(u32 frame_id) {
     }
 }
 
-bool DepthImage(u32 frame_id, vk::Image& image, u32& width, u32& height) {
+bool DepthImage(u32 frame_id, vk::Image& image, vk::ImageView& view, u32& width, u32& height) {
     if (frame_id >= kMaxFrames || !depth_slots[frame_id].valid) {
         return false;
     }
     image = depth_slots[frame_id].r32.image;
+    view = depth_slots[frame_id].r32.view;
     width = depth_slots[frame_id].r32.width;
     height = depth_slots[frame_id].r32.height;
     return true;

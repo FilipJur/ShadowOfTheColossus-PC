@@ -743,8 +743,10 @@ vk::ImageView Dispatch(vk::CommandBuffer cmdbuf, Scheduler& scheduler, u32 frame
     const u32 width = color.width, height = color.height;
     Dlssg::FrameInputs in{};
     vk::Image depth;
+    vk::ImageView depth_view;
     u32 depth_w = 0, depth_h = 0;
-    if (!Dlssg::GetFrameInputs(frame_id, in) || !FsrFg::DepthImage(frame_id, depth, depth_w, depth_h)) {
+    if (!Dlssg::GetFrameInputs(frame_id, in) ||
+        !FsrFg::DepthImage(frame_id, depth, depth_view, depth_w, depth_h)) {
         CountFrame(SkipInputs);
         return {};
     }
@@ -813,7 +815,7 @@ vk::ImageView Dispatch(vk::CommandBuffer cmdbuf, Scheduler& scheduler, u32 frame
     };
     inputs.depth = {
         .image = depth,
-        .view = {},
+        .view = depth_view,
         .format = vk::Format::eR32Sfloat,
         .size = vk::Extent2D{depth_w, depth_h},
         .layout = vk::ImageLayout::eGeneral,
