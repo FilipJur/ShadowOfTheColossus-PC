@@ -135,6 +135,10 @@ def merged_source(game, update, out):
 
 def main():
     load_ini()
+    # The FSR 4 assets live beside the repo / AppImage data dir (SOTC_DATA_DIR when set, else the
+    # folder holding sotc.py), overridable with SOTC_FSR4_DIR; the launcher never sets it.
+    if os.environ.get('SOTC_UPSCALER') == 'fsr4':
+        os.environ.setdefault('SOTC_FSR4_DIR', str(DATA / 'fsr4_411'))
     env = os.environ
     DATA.mkdir(parents=True, exist_ok=True)
     os.chdir(DATA)

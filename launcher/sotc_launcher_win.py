@@ -303,7 +303,10 @@ SCREENS = [('1920x1080', '16:9, 1080p'), ('2560x1440', '16:9, 1440p'), ('3840x21
            ('3840x1080', '32:9'), ('5120x1440', '32:9')]
 OUTPUTS = [('1280x720', ('1280 × 720 (16:9, 720p)', '1280 × 720 (16:9, 720p)'))] + [
     (size, (f"{size.replace('x', ' × ')} ({label})",) * 2) for size, label in SCREENS]
-UPSCALERS = [('fsr1', ('FSR 1 (AMD, qualquer placa)', 'FSR 1 (AMD, any GPU)')),
+UPSCALERS = [('fsr1', ('FSR 1 (padrão)', 'FSR 1 (default)')),
+             ('fsr3', ('FSR 3.1', 'FSR 3.1')),
+             ('fsr4', ('FSR 4.1.1 INT8 (build RDNA2)', 'FSR 4.1.1 INT8 (RDNA2 build)')),
+             ('ffxapi', ('FSR 3.1 via FFX API DLL (OptiScaler)', 'FSR 3.1 via FFX API DLL (OptiScaler)')),
              ('dlss', ('NVIDIA DLSS (experimental)', 'NVIDIA DLSS (experimental)')),
              ('bilinear', ('Bilinear (simples)', 'Bilinear (plain)'))]
 # Button icons in the game: the PlayStation prompts, or Xbox ones drawn for the port
@@ -804,11 +807,13 @@ def game_environment(s):
         env['SOTC_RENDER_RES'] = dlss_render(output, s.get('dlss_mode'))
     elif output not in ('1280x720', '1920x1080') and env['SOTC_NEO'] == '0':
         env['SOTC_RENDER_RES'] = output
-    # DLSS: FSR 1 stays the upscaler of frames without the game's scene (menus) and the fallback
-    # without an RTX card or the NVIDIA DLLs.
+    # FSR 1 stays the upscaler of frames without the game's scene (menus) and the fallback
+    # without an RTX card or the NVIDIA DLLs. Temporal upscalers (fsr3/fsr4/ffxapi) go through
+    # SOTC_UPSCALER; unset = FSR 1.
     env['BB_FSR1'] = '1' if upscaler in ('fsr1', 'dlss') else '0'
+    if upscaler in ('fsr3', 'fsr4', 'ffxapi', 'dlss'):
+        env['SOTC_UPSCALER'] = upscaler
     if upscaler == 'dlss':
-        env['SOTC_UPSCALER'] = 'dlss'
         env['SOTC_DLSS_SHARPEN'] = str(s.get('dlss_sharpen') or '0')
         env['SOTC_DLSS_UI_SHARPEN'] = str(s.get('dlss_ui_sharpen') or '3')
         env['SOTC_DLSS_SKY_SHARPEN'] = str(s.get('dlss_sky_sharpen') or '2')
@@ -1803,7 +1808,8 @@ class Launcher:
     def summary(self):
         parts = [dict((k, _(*v)) for k, v in FPS_MODES).get(self.var('fps_mode').get(), '30 FPS'),
                  self.var('output_res').get().replace('x', ' × '),
-                 {'fsr1': 'FSR 1', 'dlss': 'DLSS'}.get(self.var('upscaler').get(), 'bilinear')]
+                 {'fsr1': 'FSR 1', 'fsr3': 'FSR 3.1', 'fsr4': 'FSR 4.1.1', 'ffxapi': 'FFX API',
+                  'dlss': 'DLSS'}.get(self.var('upscaler').get(), 'bilinear')]
         framegen = self.var('framegen').get()
         if framegen != 'off':
             parts.append({'auto': _('geração de quadros', 'frame generation'), 'dlss': 'DLSS-G',
