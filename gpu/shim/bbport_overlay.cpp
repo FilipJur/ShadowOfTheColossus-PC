@@ -1020,6 +1020,23 @@ void UpscalerLabel(const char* label, float fps_bottom) {
     ImGui::End();
 }
 
+// sotc: the frame generation toggle key, from SOTC_KEY_FRAMEGEN (SDL key name,
+// e.g. F4); defaults to F8. Resolved once.
+SDL_Keycode FrameGenKey() {
+    static const SDL_Keycode key = [] {
+        if (const char* name = std::getenv("SOTC_KEY_FRAMEGEN")) {
+            if (name[0] != '\0') {
+                const SDL_Keycode k = SDL_GetKeyFromName(name);
+                if (k != SDLK_UNKNOWN) {
+                    return k;
+                }
+            }
+        }
+        return SDLK_F8;
+    }();
+    return key;
+}
+
 float FpsCounter() {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     const float pad = 12.0f * base_scale;
@@ -1127,8 +1144,8 @@ float FpsCounter() {
                            SotcStats::vram_budget.load(std::memory_order_relaxed) / 1073741824.0);
         ImGui::SameLine();
     }
-    ImGui::TextDisabled(SotcUi::T("F7: %s   F8: geração de quadros   F10: esconder", "F7: %s   F8: frame generation   F10: hide"),
-                        FpsModeName(FpsMode()));
+    ImGui::TextDisabled(SotcUi::T("F7: %s   %s: geração de quadros   F10: esconder", "F7: %s   %s: frame generation   F10: hide"),
+                        FpsModeName(FpsMode()), SDL_GetKeyName(FrameGenKey()));
     const float bottom = ImGui::GetWindowPos().y + ImGui::GetWindowSize().y;
     ImGui::End();
     return bottom;
@@ -1250,13 +1267,14 @@ bool HandleEvent(const SDL_Event& event) {
                                          "F6: flips on the vblank grid"));
         return true;
     }
-    // sotc: F8 switches the frame generation mode (off, DLSS-G, FSR 3; vk_framegen.h).
+    // sotc: the frame generation key (SOTC_KEY_FRAMEGEN, default F8) switches the frame
+    // generation mode (off, DLSS-G, FSR 3; vk_framegen.h).
     // The new mode is shown at the next frame (Render).
-    if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F8 && !event.key.repeat) {
+    if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == FrameGenKey() && !event.key.repeat) {
         const Vulkan::FrameGen::Mode mode = Vulkan::FrameGen::Cycle();
         const char* fg_event_names[] = {SotcUi::T("desligada", "off"), "NVIDIA DLSS-G", "AMD FSR 3"};
-        SotcEvent::Log("KEY", SotcUi::T("F8: geração de quadros %s", "F8: frame generation %s"),
-                       fg_event_names[static_cast<int>(mode)]);
+        SotcEvent::Log("KEY", SotcUi::T("%s: geração de quadros %s", "%s: frame generation %s"),
+                       SDL_GetKeyName(FrameGenKey()), fg_event_names[static_cast<int>(mode)]);
         if (mode == Vulkan::FrameGen::Mode::Off &&
             !Vulkan::FrameGen::Available(Vulkan::FrameGen::Mode::Fsr) &&
             !Vulkan::FrameGen::Available(Vulkan::FrameGen::Mode::Dlss)) {

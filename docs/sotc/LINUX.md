@@ -70,6 +70,7 @@ SOTC_CVARS=doIndexBufferCulling=0 doSunShadowIndexBufferCulling=0 fog_enable=0
 | `BB_USER_NAME` | nome do jogador / player name |
 | `BB_GAMEPAD` | parte do nome do controle / part of the controller's name |
 | `SOTC_MOUSE`, `SOTC_MOUSE_SENS`, `SOTC_MOUSE_INVERT` | câmera no mouse / mouse camera: `0` desliga / off; sensibilidade / sensitivity (padrão / default `1.0`); `1` inverte / inverts Y |
+| `SOTC_KEY_FRAMEGEN` | tecla da geração de quadros / frame generation key (SDL key name, padrão / default `F8`; ex. `F4`) |
 | `key.<ação>=Teclas` | teclas do SDL, vírgula separa / SDL key names, comma-separated (`key.cross=Space,Return`) |
 | `pad.<ação>=botões` | botões do SDL / SDL buttons (`a b x y back start leftshoulder rightshoulder lefttrigger righttrigger dpup ...`) |
 
